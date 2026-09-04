@@ -1,17 +1,18 @@
 {
   "name": "shyre",
   "displayName": "Shyre",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Time tracking for coding agents: session hooks that record each run of activity as a Shyre time entry, the Shyre MCP server, and the log-your-own-time convention.",
   "author": {
     "name": "Malcom IO LLC",
     "url": "https://shyre.malcom.io"
   },
-  "homepage": "https://shyre.malcom.io/docs/guides/features/agent-hooks-kit",
+  "homepage": "https://github.com/theshyre/plugins",
   "keywords": [
     "time-tracking",
     "shyre",
     "hooks",
     "mcp"
-  ]
+  ],
+  "license": "MIT"
 }

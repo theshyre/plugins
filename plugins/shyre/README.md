@@ -3,6 +3,8 @@
 Deterministic time tracking for coding-agent sessions, plus the Shyre MCP
 server and the log-your-own-time convention, in one installable unit.
 
+Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
+
 ```
 claude plugin marketplace add theshyre/plugins
 claude plugin install shyre@theshyre
@@ -33,4 +35,6 @@ node ~/.shyre/bin/shyre-hook.mjs install cursor
 ```
 
 `node shyre-hook.mjs doctor` prints what the runtime can see. The full guide
-is at https://shyre.malcom.io/docs/guides/features/agent-hooks-kit.
+is at https://shyre.malcom.io/docs/guides/features/agent-hooks-kit (Shyre
+account required). Verify a downloaded runtime against its checksum, served beside it at
+`/hooks/shyre-hook.mjs.sha256` and published with each release here.

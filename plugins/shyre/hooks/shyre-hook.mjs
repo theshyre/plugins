@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Malcom IO LLC. Licensed under the MIT License; see the
+// LICENSE file published with this plugin at https://github.com/theshyre/plugins.
+//
 // Shyre agent-session logger — ONE runtime for every coding agent.
 //
 // Runs on the agent's lifecycle hooks and records a time entry for each run
@@ -1009,7 +1013,8 @@ function cmdDoctor() {
     `shyre-hook ${VERSION}`,
     `home: ${shyreHome()}`,
     `api: ${cfg.apiUrl}`,
-    `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 16)}…)` : "MISSING — export SHYRE_API_KEY or write ~/.shyre/config.json"}`,
+    // Only the prefix and four characters: doctor output ends up in issues.
+    `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}…)` : "MISSING — export SHYRE_API_KEY or write ~/.shyre/config.json"}`,
     `config file: ${configNote}`,
     `idle cap: ${cfg.idleCapSeconds}s`,
     `map: ${readMapFile() ? "found" : "none (server github_repo fallback only)"}`,
