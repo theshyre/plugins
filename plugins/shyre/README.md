@@ -18,7 +18,9 @@ What ships:
 - `hooks/hooks.json` — SessionStart, UserPromptSubmit, PostToolUse,
   SubagentStop, Stop and SessionEnd all run `hooks/shyre-hook.mjs`, the Node
   runtime that records activity marks and, at session end, spools one time
-  entry per run of activity.
+  entry per run of activity. It is built from `hooks/shyre-hook.ts`, the
+  TypeScript source shipped beside it; the artifact is one plain JavaScript
+  file with no dependencies, because a hook runs as a bare `node` command.
 - `.mcp.json` — the Shyre MCP server with the bearer token from your
   environment.
 - `skills/log-your-time` — how to log categorized, invoice-ready entries at

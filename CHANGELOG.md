@@ -4,6 +4,15 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.0.2 — 2026-09-03
+
+- The runtime is now authored in TypeScript (`hooks/shyre-hook.ts`, shipped
+  beside the artifact) and compiled to `hooks/shyre-hook.mjs` by esbuild for
+  Node 18; behavior is unchanged. What runs on your machine is still one
+  plain JavaScript file with no dependencies.
+- The build is checked: the checked-in artifact, the copy the app serves and
+  its checksum must all equal the build of the source.
+
 ## 1.0.1 — 2026-09-03
 
 - The MCP server origin is fixed to `https://shyre.malcom.io` in the

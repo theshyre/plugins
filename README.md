@@ -27,7 +27,7 @@ the short version.
 | Path | What |
 | --- | --- |
 | `.claude-plugin/marketplace.json` | The marketplace manifest Claude Code reads |
-| `plugins/shyre/` | The plugin: `hooks/hooks.json`, `hooks/shyre-hook.mjs`, `.mcp.json`, `skills/log-your-time` |
+| `plugins/shyre/` | The plugin: `hooks/hooks.json`, `hooks/shyre-hook.ts` (the source) and `hooks/shyre-hook.mjs` (its build, the file that runs), `.mcp.json`, `skills/log-your-time` |
 
 This repository is a **build output**. The plugin is developed, tested and
 reviewed inside the Shyre repository and published here on each release, so
