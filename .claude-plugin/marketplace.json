@@ -1,0 +1,15 @@
+{
+  "name": "theshyre",
+  "description": "Plugins for coding agents that work with Shyre: deterministic time tracking for agent sessions, the Shyre MCP server, and the log-your-own-time convention.",
+  "owner": {
+    "name": "Malcom IO LLC",
+    "url": "https://shyre.malcom.io"
+  },
+  "plugins": [
+    {
+      "name": "shyre",
+      "source": "./plugins/shyre",
+      "description": "Time tracking for coding agents: session hooks, the Shyre MCP server, and the log-your-own-time convention."
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "shyre": {
+      "type": "http",
+      "url": "${SHYRE_API_URL:-https://shyre.malcom.io}/api/mcp",
+      "headers": {
+        "Authorization": "Bearer ${SHYRE_API_KEY}"
+      }
+    }
+  }
+}
