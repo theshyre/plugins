@@ -107,7 +107,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -212,6 +212,10 @@ export interface SpoolItem {
   created?: string;
   /** Sweeps that reached the server about this item and kept it. */
   tries?: number;
+  /** Drop reports that reached a server which answered and did not record
+   *  the drop. Gates the give-up the way `tries` gates the prune: a report
+   *  that never reached anyone is not an attempt. */
+  drop_attempts?: number;
   /** In memory only: this sweep got an answer from the server about this item. */
   contacted?: boolean;
   /** The run's marks, LOCAL ONLY: never sent as such. Absent on items an
@@ -1371,11 +1375,74 @@ function coerceSpoolItem(value: unknown): SpoolItem | null {
     ...(Array.isArray(value.done) ? { done: value.done.filter((d: unknown): d is string => typeof d === "string") } : {}),
     ...(typeof value.created === "string" ? { created: value.created } : {}),
     ...(typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {}),
+    ...(typeof value.drop_attempts === "number" && Number.isFinite(value.drop_attempts) && value.drop_attempts >= 0 ? { drop_attempts: value.drop_attempts } : {}),
   };
 }
 
 /** Sweeps an item may be kept through before it is pruned regardless of age — an item without a `created` stamp is rewritten on every keep, so age alone would never prune it. */
 export const MAX_TRIES = 20;
+/** Days a tried-and-kept item waits in the spool before it is dropped. Seven
+ *  lost a week of hours to an outage that outlasted it; a stale file costs
+ *  nothing. The marketing copy and the guide name this number. */
+export const PRUNE_AFTER_DAYS = 30;
+/** Where the runtime tells the server it is giving up on a run, so the drop
+ *  reaches the token owner's activity list and not only this machine's log. */
+export const DROP_REPORT_PATH = "/api/v1/entries/dropped";
+
+/** Days an undeliverable run may wait for the server to be TOLD of its drop
+ *  before the file goes with only the local log to show for it. Bounds the
+ *  keep: a kill switch left on, a server without the route, a token never
+ *  re-minted. Three times the retry window. */
+export const DROP_GIVE_UP_DAYS = 90;
+/** Answered drop reports that did not record the drop, before the give-up
+ *  may fire. Age alone deleted a run on the first sweep after four months
+ *  away — before the network was even up — with "could not be told for 90
+ *  days" as its epitaph, when it had never been asked once. */
+export const DROP_GIVE_UP_ATTEMPTS = 3;
+/** Only an owner/repo key travels. A remote that is a local path
+ *  ("/Users/…/client-secret", "file:///…", a network share) is a working
+ *  directory by another name, which the payload promise says never leaves. */
+const REPO_KEY_SHAPE = /^(?!\.{1,2}\/)[a-z0-9._-]+\/[a-z0-9._-]+$/;
+export type DropReason = "retry_window_elapsed" | "retry_cap_reached";
+
+/**
+ * Tell the server a run is about to be dropped. Sent BEFORE the delete:
+ * a drop nobody but this laptop's log knew about was silent loss. Carries
+ * the same fields the entry would have — window, label, session, key — plus
+ * the counts and why; never the working directory or the marks.
+ *
+ * Only a verified record — a 2xx whose body is the route's `{recorded:
+ * true}` — is a report. Everything else means the server has not heard it:
+ * no answer, a 3xx (a proxy answered, not Shyre), a 401 (a rotated token,
+ * or the team's integrations switched off — a security control that must
+ * hold data, not erase it), a 404 from a server without the route, a 5xx,
+ * a 200 that is a sign-in page. The caller keeps the file for all of them,
+ * bounded by DROP_GIVE_UP_DAYS.
+ */
+async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, keptDays: number): Promise<{ reported: boolean; contacted: boolean; why: string }> {
+  if (!cfg.apiKey) return { reported: false, contacted: false, why: "no credential" };
+  const res = await http("POST", `${cfg.apiUrl}${DROP_REPORT_PATH}`, {
+    apiKey: cfg.apiKey,
+    agent: item.agent,
+    session: item.session,
+    body: {
+      agent_label: item.label.slice(0, 64),
+      repo_key: item.repo_key && REPO_KEY_SHAPE.test(item.repo_key) ? item.repo_key : undefined,
+      start_time: item.start_time,
+      end_time: item.end_time,
+      session_ref: item.session_ref.slice(0, 128),
+      idempotency_key: item.idempotency_key.slice(0, 128),
+      tries: item.tries ?? 0,
+      kept_days: Math.max(0, keptDays),
+      reason,
+    },
+  });
+  if (res.status >= 200 && res.status < 300) {
+    if (isRecord(res.json) && res.json.recorded === true) return { reported: true, contacted: true, why: "" };
+    return { reported: false, contacted: true, why: `${res.status} without a record` };
+  }
+  return { reported: false, contacted: res.status > 0, why: res.status ? String(res.status) : `no network: ${res.text.replace(/\s+/g, " ").slice(0, 120)}` };
+}
 
 /** Sweep the spool, then the leftovers. Runs detached; never prints. */
 export async function cmdFlush(cfg: Config): Promise<void> {
@@ -1383,6 +1450,8 @@ export async function cmdFlush(cfg: Config): Promise<void> {
   const cache: ProjectsCache = {};
   const dayAgo = Date.now() - 86400 * 1000;
   const weekAgo = Date.now() - 7 * 86400 * 1000;
+  const pruneBefore = Date.now() - PRUNE_AFTER_DAYS * 86400 * 1000;
+  const giveUpBefore = Date.now() - DROP_GIVE_UP_DAYS * 86400 * 1000;
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
     if (name.endsWith(".tmp")) {
@@ -1425,26 +1494,76 @@ export async function cmdFlush(cfg: Config): Promise<void> {
       if (!item) {
         // Parsed, but without a window this runtime can post. Another copy of
         // the runtime may understand it; leave it to that copy or to the prune.
-        if (stat.mtimeMs < weekAgo) {
-          logRefusal(`${name}\tpruned: shape not recognized by any sweep for 7 days`);
+        if (stat.mtimeMs < pruneBefore) {
+          logRefusal(`${name}\tpruned: shape not recognized by any sweep for ${PRUNE_AFTER_DAYS} days`);
           unlinkSync(path);
         } else {
           logRefusal(`${name}\tshape not recognized by runtime ${VERSION}, kept`);
         }
         continue;
       }
-      // Pruned only after it was TRIED and kept for a week — a Friday session
-      // whose flush died with the lid, then a vacation, is delivered on the
-      // first sweep back, not pruned unattempted. The age is the item's own
-      // `created` (an older item without one uses the file's time), because
-      // recording a delivered part rewrites the file.
+      // Pruned only after it was TRIED and kept for PRUNE_AFTER_DAYS — a
+      // Friday session whose flush died with the lid, then a vacation, is
+      // delivered on the first sweep back, not pruned unattempted. The age is
+      // the item's own `created` (an older item without one uses the file's
+      // time), because recording a delivered part rewrites the file.
       const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
       const age = Number.isFinite(createdMs) ? createdMs : stat.mtimeMs;
       // MAX_TRIES is for items with no creation stamp — an older runtime's —
       // which a rewrite would otherwise keep young forever.
-      if ((age < weekAgo && (item.tries ?? 0) >= 1) || (!item.created && (item.tries ?? 0) >= MAX_TRIES)) {
-        logRefusal(`${name}\tpruned: kept for retry ${item.tries} time(s)${age < weekAgo ? " over 7 days" : ""}`);
-        unlinkSync(path);
+      const windowElapsed = age < pruneBefore && (item.tries ?? 0) >= 1;
+      if (windowElapsed || (!item.created && (item.tries ?? 0) >= MAX_TRIES)) {
+        const why = `kept for retry ${item.tries} time(s)${windowElapsed ? ` over ${PRUNE_AFTER_DAYS} days` : ""}`;
+        // Told on an earlier sweep whose delete then failed: not said twice.
+        if (isRecord(parsed) && parsed.drop_reported === true) {
+          logRefusal(`${name}\tpruned: ${why}; reported to the server on an earlier sweep`);
+          unlinkSync(path);
+          continue;
+        }
+        // The server is told before the file goes, and only a verified
+        // record deletes. If it cannot be told, the file stays: a drop during
+        // the outage that caused it would be the one nobody ever hears about.
+        const report = await reportDrop(item, cfg, windowElapsed ? "retry_window_elapsed" : "retry_cap_reached", Math.round((Date.now() - age) / (86400 * 1000)));
+        if (report.reported) {
+          logRefusal(`${name}\tpruned: ${why}; reported to the server`);
+          try {
+            unlinkSync(path);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+              // Remember that the server knows, so the next sweep deletes
+              // without reporting the same drop again. Covers a file the OS
+              // holds locked (Windows), not an unwritable directory — there
+              // the mark cannot be written either, and the next sweep says
+              // the drop again, bounded by the server's ceiling.
+              try {
+                writeAtomic(path, JSON.stringify({ ...(isRecord(parsed) ? parsed : {}), drop_reported: true }), 0o600);
+              } catch (err2) {
+                logRefusal(`${name}\tcould not delete or mark the reported item: ${errorMessage(err2)}`);
+              }
+            }
+          }
+          continue;
+        }
+        // Kept until the server can be told — but not forever. Past the
+        // give-up bound the file goes with this line as its only record.
+        // An answered report that did not record is an attempt; no answer
+        // is not — a closed laptop, a VPN not yet up, a key not yet exported
+        // must not run this down. Remembered on the file.
+        if (report.contacted) {
+          item.drop_attempts = (item.drop_attempts ?? 0) + 1;
+          try {
+            writeAtomic(path, JSON.stringify({ ...(isRecord(parsed) ? parsed : {}), drop_attempts: item.drop_attempts }), 0o600);
+          } catch (err) {
+            logRefusal(`${name}\tcould not record the drop attempt: ${errorMessage(err)}`);
+          }
+        }
+        const attempts = item.drop_attempts ?? 0;
+        if (attempts >= DROP_GIVE_UP_ATTEMPTS && (age < giveUpBefore || !item.created)) {
+          logRefusal(`${name}\tpruned: ${why}; the server could not be told in ${attempts} answered attempt(s) over ${DROP_GIVE_UP_DAYS} days (last answer: ${report.why})`);
+          unlinkSync(path);
+          continue;
+        }
+        logRefusal(`${name}\tto be dropped (${why}); the server could not be told (${report.why}), kept until it can`);
         continue;
       }
       const before = JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 });

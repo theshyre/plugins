@@ -4,6 +4,25 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.2.0 — 2026-09-05
+- An undeliverable run waits thirty days, not seven. The prune still counts
+  only sweeps that reached a server which answered, so a closed laptop does
+  not run the clock down; an outage that outlasted the week was losing the
+  week.
+- A run is dropped only after the server has been told. The sweep posts the
+  drop — window, label, session, key, counts, why; never the working
+  directory or the marks, and a repository key only when it is an
+  `owner/repo` key rather than a local path — to `POST /api/v1/entries/dropped`,
+  and it lands in the token owner's activity list beside the other refusals.
+  Only the server's own `{recorded: true}` deletes the file. No answer, a
+  redirect, a 401 (a rotated token, or integrations switched off for the
+  team — a kill switch holds data, it does not erase it), a 404 from a
+  server without the route, a 5xx, a 429, or a sign-in page served as a 200
+  all keep the file — until it is ninety days old and three answered reports
+  have failed to record it; then it goes with the local log line as its only
+  record. A report that never reached a server is not an attempt. A report whose delete then failed is remembered
+  on the file, so the drop is never said twice.
+
 ## 1.1.0 — 2026-09-05
 - The API origin is `https://shyre.io`, the canonical address since
   2026-09-04. The legacy host keeps answering `/api/**` and `/hooks/**`

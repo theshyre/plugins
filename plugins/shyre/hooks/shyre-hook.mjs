@@ -110,7 +110,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.1.0";
+var VERSION = "1.2.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -899,15 +899,47 @@ function coerceSpoolItem(value) {
     ...marks ? { marks } : {},
     ...Array.isArray(value.done) ? { done: value.done.filter((d) => typeof d === "string") } : {},
     ...typeof value.created === "string" ? { created: value.created } : {},
-    ...typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {}
+    ...typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {},
+    ...typeof value.drop_attempts === "number" && Number.isFinite(value.drop_attempts) && value.drop_attempts >= 0 ? { drop_attempts: value.drop_attempts } : {}
   };
 }
 var MAX_TRIES = 20;
+var PRUNE_AFTER_DAYS = 30;
+var DROP_REPORT_PATH = "/api/v1/entries/dropped";
+var DROP_GIVE_UP_DAYS = 90;
+var DROP_GIVE_UP_ATTEMPTS = 3;
+var REPO_KEY_SHAPE = /^(?!\.{1,2}\/)[a-z0-9._-]+\/[a-z0-9._-]+$/;
+async function reportDrop(item, cfg, reason, keptDays) {
+  if (!cfg.apiKey) return { reported: false, contacted: false, why: "no credential" };
+  const res = await http("POST", `${cfg.apiUrl}${DROP_REPORT_PATH}`, {
+    apiKey: cfg.apiKey,
+    agent: item.agent,
+    session: item.session,
+    body: {
+      agent_label: item.label.slice(0, 64),
+      repo_key: item.repo_key && REPO_KEY_SHAPE.test(item.repo_key) ? item.repo_key : void 0,
+      start_time: item.start_time,
+      end_time: item.end_time,
+      session_ref: item.session_ref.slice(0, 128),
+      idempotency_key: item.idempotency_key.slice(0, 128),
+      tries: item.tries ?? 0,
+      kept_days: Math.max(0, keptDays),
+      reason
+    }
+  });
+  if (res.status >= 200 && res.status < 300) {
+    if (isRecord(res.json) && res.json.recorded === true) return { reported: true, contacted: true, why: "" };
+    return { reported: false, contacted: true, why: `${res.status} without a record` };
+  }
+  return { reported: false, contacted: res.status > 0, why: res.status ? String(res.status) : `no network: ${res.text.replace(/\s+/g, " ").slice(0, 120)}` };
+}
 async function cmdFlush(cfg) {
   const dir = spoolDir();
   const cache = {};
   const dayAgo = Date.now() - 86400 * 1e3;
   const weekAgo = Date.now() - 7 * 86400 * 1e3;
+  const pruneBefore = Date.now() - PRUNE_AFTER_DAYS * 86400 * 1e3;
+  const giveUpBefore = Date.now() - DROP_GIVE_UP_DAYS * 86400 * 1e3;
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
     if (name.endsWith(".tmp")) {
@@ -938,8 +970,8 @@ async function cmdFlush(cfg) {
       }
       const item = coerceSpoolItem(parsed);
       if (!item) {
-        if (stat.mtimeMs < weekAgo) {
-          logRefusal(`${name}	pruned: shape not recognized by any sweep for 7 days`);
+        if (stat.mtimeMs < pruneBefore) {
+          logRefusal(`${name}	pruned: shape not recognized by any sweep for ${PRUNE_AFTER_DAYS} days`);
           unlinkSync(path);
         } else {
           logRefusal(`${name}	shape not recognized by runtime ${VERSION}, kept`);
@@ -948,9 +980,45 @@ async function cmdFlush(cfg) {
       }
       const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
       const age = Number.isFinite(createdMs) ? createdMs : stat.mtimeMs;
-      if (age < weekAgo && (item.tries ?? 0) >= 1 || !item.created && (item.tries ?? 0) >= MAX_TRIES) {
-        logRefusal(`${name}	pruned: kept for retry ${item.tries} time(s)${age < weekAgo ? " over 7 days" : ""}`);
-        unlinkSync(path);
+      const windowElapsed = age < pruneBefore && (item.tries ?? 0) >= 1;
+      if (windowElapsed || !item.created && (item.tries ?? 0) >= MAX_TRIES) {
+        const why = `kept for retry ${item.tries} time(s)${windowElapsed ? ` over ${PRUNE_AFTER_DAYS} days` : ""}`;
+        if (isRecord(parsed) && parsed.drop_reported === true) {
+          logRefusal(`${name}	pruned: ${why}; reported to the server on an earlier sweep`);
+          unlinkSync(path);
+          continue;
+        }
+        const report = await reportDrop(item, cfg, windowElapsed ? "retry_window_elapsed" : "retry_cap_reached", Math.round((Date.now() - age) / (86400 * 1e3)));
+        if (report.reported) {
+          logRefusal(`${name}	pruned: ${why}; reported to the server`);
+          try {
+            unlinkSync(path);
+          } catch (err) {
+            if (err.code !== "ENOENT") {
+              try {
+                writeAtomic(path, JSON.stringify({ ...isRecord(parsed) ? parsed : {}, drop_reported: true }), 384);
+              } catch (err2) {
+                logRefusal(`${name}	could not delete or mark the reported item: ${errorMessage(err2)}`);
+              }
+            }
+          }
+          continue;
+        }
+        if (report.contacted) {
+          item.drop_attempts = (item.drop_attempts ?? 0) + 1;
+          try {
+            writeAtomic(path, JSON.stringify({ ...isRecord(parsed) ? parsed : {}, drop_attempts: item.drop_attempts }), 384);
+          } catch (err) {
+            logRefusal(`${name}	could not record the drop attempt: ${errorMessage(err)}`);
+          }
+        }
+        const attempts = item.drop_attempts ?? 0;
+        if (attempts >= DROP_GIVE_UP_ATTEMPTS && (age < giveUpBefore || !item.created)) {
+          logRefusal(`${name}	pruned: ${why}; the server could not be told in ${attempts} answered attempt(s) over ${DROP_GIVE_UP_DAYS} days (last answer: ${report.why})`);
+          unlinkSync(path);
+          continue;
+        }
+        logRefusal(`${name}	to be dropped (${why}); the server could not be told (${report.why}), kept until it can`);
         continue;
       }
       const before = JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 });
@@ -1395,11 +1463,15 @@ export {
   COVERAGE_MAX_PAGES,
   COVERAGE_PAGE_SIZE,
   DEFAULT_API_URL,
+  DROP_GIVE_UP_ATTEMPTS,
+  DROP_GIVE_UP_DAYS,
+  DROP_REPORT_PATH,
   HOOK_WIRING,
   MAX_IDLE_CAP_SECONDS,
   MAX_TRIES,
   POST_INSTALL_NOTES,
   PROMPT_MARKS_MAX,
+  PRUNE_AFTER_DAYS,
   STDIN_MAX_BYTES,
   VERSION,
   buildEntryBody,
