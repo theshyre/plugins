@@ -7,8 +7,8 @@ description: Log the time you just spent to Shyre when you finish a substantial 
 
 The session hooks record every session as a backstop. This skill is the
 intent layer: when you finish a unit of work, write the entry yourself, with a
-real description and the right category. The hook stands down when your entry
-already covers the window, so nothing is counted twice.
+real description and the right category. The hook stands down for the minutes
+your entries already cover, on any project, so nothing is counted twice.
 
 **Local override:** if the repo's own `CLAUDE.md` or `AGENTS.md` defines its
 own time-logging convention, follow that instead.
@@ -46,8 +46,18 @@ completed, a review delivered. Not after every small edit.
 3. **On a 409**, read the message: it names the blocking window and the
    earliest free start. Retry once with that start. Do not probe.
 
+## Parallel sessions
+
+Two sessions running side by side, on two projects, are two machine meters
+over one clock. They **apportion** the person's time; they do not each claim
+it. Log the person's time once, to the project it belonged to, or split the
+window between the two. Shyre records the overlap either way and shows it in
+the day view with a resolver; do not resolve it by logging the same hour
+twice.
+
 ## Never
 
 - Log elapsed wall-clock time as work.
+- Claim a person's whole window for each of two parallel sessions.
 - Edit or delete an entry a person logged; the API refuses it anyway.
 - Start a timer while one is running; prefer `log_time_entry` after the work.

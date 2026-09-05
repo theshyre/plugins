@@ -30,13 +30,16 @@ Other agents use the same runtime through its installer:
 
 ```
 mkdir -p ~/.shyre/bin
-curl -fsSL https://shyre.malcom.io/hooks/shyre-hook.mjs -o ~/.shyre/bin/shyre-hook.mjs.part \
+curl -fsSL https://shyre.io/hooks/shyre-hook.mjs -o ~/.shyre/bin/shyre-hook.mjs.part \
   && mv ~/.shyre/bin/shyre-hook.mjs.part ~/.shyre/bin/shyre-hook.mjs
 node ~/.shyre/bin/shyre-hook.mjs install codex
 node ~/.shyre/bin/shyre-hook.mjs install cursor
 ```
 
 `node shyre-hook.mjs doctor` prints what the runtime can see. The full guide
-is at https://shyre.malcom.io/docs/guides/features/agent-hooks-kit (Shyre
-account required). Verify a downloaded runtime against its checksum, served beside it at
-`/hooks/shyre-hook.mjs.sha256` and published with each release here.
+is at https://shyre.io/docs/guides/features/agent-hooks-kit (Shyre
+account required). To verify a downloaded runtime, compare its SHA-256 with the
+file at the matching `v<version>` tag in this repository — a second origin. The
+checksum served beside it at `/hooks/shyre-hook.mjs.sha256` only shows the
+download arrived intact; whoever could serve you a changed runtime could serve
+you its hash.

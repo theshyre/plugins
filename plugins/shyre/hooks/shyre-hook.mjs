@@ -21,8 +21,8 @@ import {
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 /*!
  * Shyre agent-session logger — ONE runtime for every coding agent.
@@ -57,11 +57,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   thrown away (a 13-hour session logged 91 minutes). `start` here APPENDS a
  *   mark when state already exists.
  *
- * • One entry per RUN of activity, with real timestamps. The shell kit posted
+ * • One entry per RUN of activity, with real timestamps — split only where
+ *   your own entries already cover part of it. The shell kit posted
  *   `[session start, session start + active]`, which for a multi-day session
  *   fabricated one contiguous window on day one. A run is a stretch of marks
- *   with no gap over the idle cap; each run becomes one entry with its true
- *   start and end. Nothing is bridged, nothing is invented.
+ *   with no gap over the idle cap; each run becomes an entry with its true
+ *   start and end, or one entry per uncovered stretch of it. Nothing is
+ *   bridged, nothing is invented.
  *
  * • SessionEnd does no network. Claude Code gives SessionEnd hooks 1.5 s
  *   shared; Codex gives 1 s and ignores `async`. `end` writes spool files and
@@ -83,8 +85,32 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  * • Both meters (agent_runtime_min / agent_wait_min) are computed from the
  *   beat tags: a gap that STARTS at `stop` is the agent waiting on the human;
  *   any other gap is the machine working. runtime + wait == active, exactly.
+ *
+ * • The stand-down is by the MINUTE, across ALL of your projects. Before
+ *   posting, the runtime lists your entries on every project — paging with
+ *   `until` until it has every entry that starts before the run ends, plus
+ *   the running timer — and posts only the parts of the run no entry already
+ *   covers, with the meters recomputed for each part from the run's own
+ *   marks. A page that cannot be fetched, a body that is not a list, or a
+ *   list still truncated after ten pages is "coverage unknown": the run is
+ *   posted and the log says so. The first cut asked one project, one page,
+ *   and stood the whole run down on any overlap: a hook entry on the child
+ *   project landed under the agent's own entries on the parent, and one
+ *   afternoon was written down twice under two names.
+ *
+ * • A partly delivered run remembers what landed. Each settled stretch's
+ *   start is written back to the spool item (`done`), so a later sweep never
+ *   re-posts it — and never posts the whole window under the first stretch's
+ *   key, which the server would answer with that stretch as an idempotent
+ *   replay and the rest of the run would be lost. A 2xx whose entry has a
+ *   different window than the one posted is treated as exactly that replay
+ *   and the stretch is kept.
+ *
+ * • The tenth field: prompt_marks, the instants you sent a prompt inside the
+ *   run. Timestamps only — no prompt text, no diff, no file names. The day
+ *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.0.2";
+var VERSION = "1.1.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -128,10 +154,11 @@ var HOOK_WIRING = Object.freeze({
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+var MAX_IDLE_CAP_SECONDS = 86400;
 function shyreHome() {
   return process.env.SHYRE_HOME || join(homedir(), ".shyre");
 }
-var DEFAULT_API_URL = "https://shyre.malcom.io";
+var DEFAULT_API_URL = "https://shyre.io";
 function validApiUrl(raw) {
   if (typeof raw !== "string" || raw.trim() === "") return null;
   let url;
@@ -161,11 +188,11 @@ function readConfig(env = process.env) {
   const apiKey = env.SHYRE_API_KEY || fileKey;
   const apiUrl = validApiUrl(env.SHYRE_API_URL || fileUrl) || DEFAULT_API_URL;
   const cap = Number(env.SHYRE_IDLE_CAP_SECONDS || fileCap || 900);
-  return { apiKey, apiUrl, idleCapSeconds: Number.isFinite(cap) && cap > 0 ? cap : 900 };
+  return { apiKey, apiUrl, idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900 };
 }
 function repoKeyFromRemote(remote) {
   if (!remote) return null;
-  const key = String(remote).trim().replace(/^[a-z+]+:\/\/[^/]+\//i, "").replace(/^[^@]+@[^:]+:/, "").replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+  const key = String(remote).replace(/[\r\n\t]+/g, "").trim().replace(/^[a-z+]+:\/\/[^/]+\//i, "").replace(/^[^@]+@[^:]+:/, "").replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
   return key ? key.toLowerCase() : null;
 }
 function firstString(record, keys) {
@@ -241,7 +268,8 @@ function segmentRuns(marks, capSeconds) {
         end: isoSeconds(last.t),
         runtimeMin: Math.floor(runtime / 6e4),
         waitMin: Math.floor(wait / 6e4),
-        index: runs.length + 1
+        index: runs.length + 1,
+        marks: sorted.slice(i, j + 1)
       });
     }
     i = j + 1;
@@ -258,20 +286,90 @@ function buildEntryBody(item) {
     session_ref: item.session_ref,
     idempotency_key: item.idempotency_key,
     agent_runtime_min: item.agent_runtime_min,
-    agent_wait_min: item.agent_wait_min
+    agent_wait_min: item.agent_wait_min,
+    prompt_marks: item.prompt_marks
   };
 }
-function windowCovered(entries, start, end, nowIso2 = (/* @__PURE__ */ new Date()).toISOString()) {
+function uncoveredSegments(entries, start, end, nowIso2 = (/* @__PURE__ */ new Date()).toISOString()) {
   const ws = Date.parse(start);
   const we = Date.parse(end);
   const now = Date.parse(nowIso2);
-  if (!Array.isArray(entries)) return false;
-  return entries.some((e) => {
-    if (!isRecord(e)) return false;
-    const s = typeof e.start_time === "string" ? Date.parse(e.start_time) : Number.NaN;
-    const en = typeof e.end_time === "string" ? Date.parse(e.end_time) : e.end_time ? Number.NaN : now;
-    return Number.isFinite(s) && Number.isFinite(en) && s < we && en > ws;
-  });
+  if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) return [];
+  const covered = [];
+  if (Array.isArray(entries)) {
+    for (const e of entries) {
+      if (!isRecord(e)) continue;
+      const s = typeof e.start_time === "string" ? Date.parse(e.start_time) : Number.NaN;
+      const en = typeof e.end_time === "string" ? Date.parse(e.end_time) : e.end_time ? Number.NaN : Math.min(now, s + 864e5);
+      if (Number.isFinite(s) && Number.isFinite(en) && s < we && en > ws) covered.push([Math.max(s, ws), Math.min(en, we)]);
+    }
+  }
+  covered.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  let cursor = ws;
+  for (const [s, en] of covered) {
+    if (s > cursor && s - cursor >= 6e4) out.push([isoSeconds(cursor), isoSeconds(s)]);
+    cursor = Math.max(cursor, en);
+  }
+  if (we > cursor && we - cursor >= 6e4) out.push([isoSeconds(cursor), isoSeconds(we)]);
+  return out;
+}
+function uncoveredMillis(entries, start, end, nowIso2 = (/* @__PURE__ */ new Date()).toISOString()) {
+  const ws = Date.parse(start);
+  const we = Date.parse(end);
+  const now = Date.parse(nowIso2);
+  if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) return 0;
+  const covered = [];
+  if (Array.isArray(entries)) {
+    for (const e of entries) {
+      if (!isRecord(e)) continue;
+      const s = typeof e.start_time === "string" ? Date.parse(e.start_time) : Number.NaN;
+      const en = typeof e.end_time === "string" ? Date.parse(e.end_time) : e.end_time ? Number.NaN : Math.min(now, s + 864e5);
+      if (Number.isFinite(s) && Number.isFinite(en) && s < we && en > ws) covered.push([Math.max(s, ws), Math.min(en, we)]);
+    }
+  }
+  covered.sort((a, b) => a[0] - b[0]);
+  let cursor = ws;
+  let uncovered = 0;
+  for (const [s, en] of covered) {
+    if (s > cursor) uncovered += s - cursor;
+    cursor = Math.max(cursor, en);
+  }
+  if (we > cursor) uncovered += we - cursor;
+  return uncovered;
+}
+function metersFor(marks, start, end) {
+  const ws = Date.parse(start);
+  const we = Date.parse(end);
+  const sorted = [...marks].sort((a, b) => a.t - b.t);
+  let runtime = 0;
+  let wait = 0;
+  for (let i = 0; i + 1 < sorted.length; i += 1) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    if (!a || !b) break;
+    const from = Math.max(a.t, ws);
+    const to = Math.min(b.t, we);
+    if (to <= from) continue;
+    if (a.k === "stop") wait += to - from;
+    else runtime += to - from;
+  }
+  return { runtimeMin: Math.floor(runtime / 6e4), waitMin: Math.floor(wait / 6e4) };
+}
+var PROMPT_MARKS_MAX = 2e3;
+function promptMarksFor(marks, start, end) {
+  const ws = Date.parse(start);
+  const we = Date.parse(end);
+  const seconds = [...new Set(marks.filter((m) => m.k === "prompt" && m.t >= ws && m.t <= we).map((m) => Math.floor(m.t / 1e3) * 1e3))].sort((a, b) => a - b);
+  if (seconds.length <= PROMPT_MARKS_MAX) return seconds.map((t) => isoSeconds(t));
+  const out = [];
+  const last = seconds.length - 1;
+  for (let i = 0; i < PROMPT_MARKS_MAX; i += 1) {
+    const idx = Math.round(i * last / (PROMPT_MARKS_MAX - 1));
+    const t = seconds[idx];
+    if (t !== void 0) out.push(isoSeconds(t));
+  }
+  return out;
 }
 function earliestFreeStart(message) {
   const m = /earliest free start is (\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2}))/i.exec(String(message ?? ""));
@@ -300,20 +398,29 @@ function ensurePrivateDir(p) {
   }
   return p;
 }
+function modeOf(path) {
+  try {
+    return statSync(path).mode & 511;
+  } catch {
+    return void 0;
+  }
+}
 function writeAtomic(path, text, mode) {
+  const keep = mode ?? modeOf(path);
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, text, mode === void 0 ? void 0 : { mode });
+  writeFileSync(tmp, text, keep === void 0 ? void 0 : { mode: keep });
   renameSync(tmp, path);
 }
-function writeUserFile(path, text) {
+function writeUserFile(path, text, defaultMode = 384) {
+  const mode = modeOf(path) ?? defaultMode;
   if (existsSync(path)) {
     try {
       const bak = existsSync(`${path}.bak`) ? `${path}.bak.${Date.now()}` : `${path}.bak`;
-      writeFileSync(bak, readFileSync(path));
+      writeFileSync(bak, readFileSync(path), { mode });
     } catch {
     }
   }
-  writeAtomic(path, text);
+  writeAtomic(path, text, mode);
 }
 function sessionsDir() {
   ensurePrivateDir(shyreHome());
@@ -327,11 +434,20 @@ function stateBase(agent, session) {
   const safe = String(session).replace(/[^A-Za-z0-9._-]/g, "_");
   return join(sessionsDir(), `${agent}-${safe}`);
 }
+function refusalLogPath(env = process.env) {
+  const fallback = join(shyreHome(), "refusals.log");
+  const raw = env.SHYRE_HOOK_LOG;
+  if (!raw) return fallback;
+  const home = resolve(shyreHome());
+  const target = resolve(raw);
+  return target.startsWith(`${home}${sep}`) ? target : fallback;
+}
 function logRefusal(line) {
   try {
-    const target = process.env.SHYRE_HOOK_LOG || join(shyreHome(), "refusals.log");
+    const target = refusalLogPath();
     ensureDir(join(target, ".."));
-    appendFileSync(target, `${(/* @__PURE__ */ new Date()).toISOString()}	${line}
+    const flat = line.replace(/[\r\n]+/g, " ");
+    appendFileSync(target, `${(/* @__PURE__ */ new Date()).toISOString()}	${flat}
 `);
     try {
       chmodSync(target, 384);
@@ -340,22 +456,47 @@ function logRefusal(line) {
   } catch {
   }
 }
-function gitRemote(cwd) {
+function noteOncePerMinute(subject, line) {
   try {
-    return execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], {
-      encoding: "utf8",
-      timeout: 3e3,
-      stdio: ["ignore", "pipe", "ignore"],
-      windowsHide: true
-    }).trim();
+    const marker = join(ensurePrivateDir(shyreHome()), `.said-${subject}`);
+    const last = modeOf(marker) === void 0 ? 0 : statSync(marker).mtimeMs;
+    if (Date.now() - last < 6e4) return;
+    writeFileSync(marker, "", { mode: 384 });
+    logRefusal(line);
   } catch {
-    return null;
   }
 }
-function readMapFile() {
-  for (const candidate of [join(shyreHome(), "projects.json"), join(homedir(), ".claude", "shyre-projects.json")]) {
+function payloadKeys(raw) {
+  return isRecord(raw) ? Object.keys(raw).slice(0, 12).join(",") || "(none)" : typeof raw;
+}
+function gitRemote(cwd, env = process.env) {
+  const clean = { ...env };
+  for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete clean[k];
+  for (const name of ["origin", "upstream"]) {
     try {
-      return JSON.parse(readFileSync(candidate, "utf8"));
+      const url = execFileSync("git", ["-C", cwd, "remote", "get-url", name], {
+        encoding: "utf8",
+        timeout: 3e3,
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+        env: clean
+      }).trim();
+      if (url) return url;
+    } catch {
+    }
+  }
+  return null;
+}
+function mapFileCandidates() {
+  return [join(shyreHome(), "projects.json"), join(homedir(), ".claude", "shyre-projects.json")];
+}
+function readMapFile() {
+  return readMapFileFrom()?.map ?? null;
+}
+function readMapFileFrom() {
+  for (const candidate of mapFileCandidates()) {
+    try {
+      return { path: candidate, map: JSON.parse(readFileSync(candidate, "utf8")) };
     } catch {
     }
   }
@@ -365,6 +506,9 @@ function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
 }
 async function http(method, url, { apiKey, agent, session, body }) {
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && url.startsWith("https:")) {
+    return { status: 0, json: null, text: "refusing to send the token while NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate checks" };
+  }
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 1e4);
   try {
@@ -401,12 +545,18 @@ async function http(method, url, { apiKey, agent, session, body }) {
 function nowIso() {
   return isoSeconds(Date.now());
 }
+var STDIN_MAX_BYTES = 4 * 1024 * 1024;
 function readStdin() {
   try {
     if (process.stdin.isTTY) return {};
     const text = readFileSync(0, "utf8");
+    if (text.length > STDIN_MAX_BYTES) {
+      noteOncePerMinute("stdin-size", `payload of ${text.length} bytes ignored: larger than ${STDIN_MAX_BYTES}`);
+      return {};
+    }
     return text.trim() ? JSON.parse(text) : {};
-  } catch {
+  } catch (err) {
+    noteOncePerMinute("stdin-json", `payload was not JSON, nothing recorded: ${errorMessage(err).slice(0, 120)}`);
     return {};
   }
 }
@@ -418,6 +568,8 @@ function detachedFlush() {
       stdio: "ignore",
       windowsHide: true
     });
+    child.on("error", () => {
+    });
     child.unref();
   } catch {
   }
@@ -425,7 +577,10 @@ function detachedFlush() {
 function cmdStart(argvAgent, payload) {
   const agent = detectAgent(argvAgent, payload);
   const { session, cwd } = normalizePayload(payload);
-  if (!session) return;
+  if (!session) {
+    noteOncePerMinute("no-session", `${agent}	start payload names no session, nothing recorded; keys: ${payloadKeys(payload)}`);
+    return;
+  }
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) {
     const meta = {
@@ -444,7 +599,10 @@ function cmdStart(argvAgent, payload) {
 function cmdBeat(argvAgent, payload, tag) {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
-  if (!session) return;
+  if (!session) {
+    noteOncePerMinute("no-session", `${agent}	beat payload names no session, nothing recorded; keys: ${payloadKeys(payload)}`);
+    return;
+  }
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) cmdStart(agent, payload);
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
@@ -466,7 +624,10 @@ function coerceMeta(value, fallbackAgent, fallbackSession) {
 function cmdEnd(argvAgent, payload, { idleCapSeconds }) {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
-  if (!session) return;
+  if (!session) {
+    noteOncePerMinute("no-session", `${agent}	end payload names no session, nothing recorded; keys: ${payloadKeys(payload)}`);
+    return;
+  }
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) return;
   let parsed;
@@ -500,6 +661,7 @@ function cmdEnd(argvAgent, payload, { idleCapSeconds }) {
       end_time: run.end,
       agent_runtime_min: run.runtimeMin,
       agent_wait_min: run.waitMin,
+      marks: run.marks,
       // Keyed on the run's START INSTANT, not its ordinal: a session id is
       // reused across /clear and --resume, so "run 1" would recur, and the
       // server would answer the second with the FIRST entry as a replay —
@@ -539,14 +701,15 @@ async function resolveProject(item, cfg, projectsCache) {
       agent: item.agent,
       session: item.session
     });
+    if (res.status > 0) item.contacted = true;
     const rows = res.status === 200 ? toProjectRows(res.json) : null;
-    if (rows) projectsCache.list = rows;
-    else projectsCache.failed = res.status || -1;
+    if (rows && rows.length > 0) projectsCache.list = rows;
+    else projectsCache.failed = rows ? -2 : res.status || -1;
   }
   const list = projectsCache.list;
   if (!list) {
     const failed = projectsCache.failed ?? 0;
-    return { id: null, reason: "lookup-failed", status: failed > 0 ? failed : 0 };
+    return { id: null, reason: "lookup-failed", status: failed === -2 ? -2 : failed > 0 ? failed : 0 };
   }
   const hit = list.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === item.repo_key);
   return hit ? { id: hit.id } : { id: null, reason: "unmapped" };
@@ -554,41 +717,123 @@ async function resolveProject(item, cfg, projectsCache) {
 function isFinalRefusal(status) {
   return status >= 400 && status < 500 && ![401, 408, 429].includes(status);
 }
+var COVERAGE_MAX_PAGES = 10;
+var COVERAGE_PAGE_SIZE = 100;
+async function fetchCoverage(item, cfg, tag = "") {
+  const since = new Date(Date.parse(item.start_time) - 86400 * 1e3).toISOString();
+  const entries = [];
+  let until = item.end_time;
+  let previousOldest = Number.POSITIVE_INFINITY;
+  for (let page = 0; page < COVERAGE_MAX_PAGES; page += 1) {
+    const url = `${cfg.apiUrl}/api/v1/entries?limit=${COVERAGE_PAGE_SIZE}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`;
+    let res = await http("GET", url, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+    if (res.status === 429) {
+      await new Promise((r) => setTimeout(r, 1500));
+      res = await http("GET", url, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+    }
+    if (res.status > 0) item.contacted = true;
+    if (res.status !== 200) return { complete: false, reason: `coverage check answered ${res.status || "no network"}` };
+    if (!Array.isArray(res.json)) return { complete: false, reason: "coverage check answered 200 without an entries list" };
+    entries.push(...res.json);
+    if (res.json.length < COVERAGE_PAGE_SIZE) break;
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const e of res.json) {
+      if (isRecord(e) && typeof e.start_time === "string") oldest = Math.min(oldest, Date.parse(e.start_time));
+    }
+    if (!Number.isFinite(oldest) || oldest < Date.parse(since)) break;
+    if (oldest >= previousOldest) return { complete: false, reason: "coverage check made no progress: a page of entries sharing one start instant" };
+    previousOldest = oldest;
+    if (page === COVERAGE_MAX_PAGES - 1) return { complete: false, reason: `coverage check still truncated after ${COVERAGE_MAX_PAGES} pages` };
+    until = new Date(oldest + 1).toISOString();
+  }
+  let timer = await http("GET", `${cfg.apiUrl}/api/v1/timer`, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+  if (timer.status === 429) {
+    await new Promise((r) => setTimeout(r, 1500));
+    timer = await http("GET", `${cfg.apiUrl}/api/v1/timer`, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+  }
+  if (timer.status === 401 || timer.status === 403) {
+    logRefusal(`${tag}	timer check answered ${timer.status}; the running timer is not visible to this token`);
+  } else if (timer.status !== 200) {
+    return { complete: false, reason: `timer check answered ${timer.status || "no network"}` };
+  } else if (isRecord(timer.json) && typeof timer.json.start_time === "string") {
+    entries.push({ start_time: timer.json.start_time, end_time: null });
+  }
+  return { complete: true, entries };
+}
 async function deliver(item, cfg, projectsCache = {}) {
   if (!cfg.apiKey) return false;
-  const tag = `${item.label}	${item.repo_key || item.cwd}	${item.start_time}..${item.end_time}`;
+  const tag = `${item.label}	${(item.repo_key || item.cwd).replace(/[\r\n\t]+/g, " ")}	${item.start_time}..${item.end_time}`;
+  const ws = Date.parse(item.start_time);
+  const we = Date.parse(item.end_time);
+  if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) {
+    logRefusal(`${tag}	invalid window (end not after start, or unparseable): discarded`);
+    return true;
+  }
   const resolved = await resolveProject(item, cfg, projectsCache);
   if (resolved.id === null) {
     if (resolved.reason === "lookup-failed") {
-      logRefusal(`${tag}	projects lookup failed (${resolved.status || "no network"}), kept for retry`);
+      const why = resolved.status === -2 ? "the server listed no projects at all" : `${resolved.status || "no network"}`;
+      logRefusal(`${tag}	projects lookup failed (${why}), kept for retry`);
       return false;
     }
     logRefusal(`${tag}	unmapped: no map line and no project names this repo`);
     return true;
   }
   const projectId = resolved.id;
-  const since = new Date(Date.parse(item.start_time) - 86400 * 1e3).toISOString();
-  const listUrl = `${cfg.apiUrl}/api/v1/entries?project_id=${encodeURIComponent(projectId)}&limit=100&since=${encodeURIComponent(since)}`;
-  const list = await http("GET", listUrl, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
-  if (list.status === 200 && windowCovered(list.json, item.start_time, item.end_time)) {
-    logRefusal(`${tag}	covered: stood down, this window was already logged`);
-    return true;
+  const coverage = await fetchCoverage(item, cfg, tag);
+  let segments = [[isoSeconds(ws), isoSeconds(we)]];
+  if (coverage.complete) {
+    segments = uncoveredSegments(coverage.entries, item.start_time, item.end_time);
+    if (segments.length === 0) {
+      const dropped = Math.round(uncoveredMillis(coverage.entries, item.start_time, item.end_time) / 1e3);
+      logRefusal(dropped > 0 ? `${tag}	covered: stood down; ${dropped} s uncovered under the one-minute floor, dropped` : `${tag}	covered: stood down, this window was already logged`);
+      return true;
+    }
+    if (!isWhole(segments, ws, we)) {
+      const posted = segments.reduce((n, [a, b]) => n + (Date.parse(b) - Date.parse(a)), 0);
+      logRefusal(`${tag}	covered in part: stood down ${Math.round((we - ws - posted) / 6e4)} min already logged; posting ${segments.length} uncovered segment(s)`);
+    }
+  } else {
+    logRefusal(`${tag}	${coverage.reason}; posting without it`);
   }
-  if (list.status !== 200) {
-    logRefusal(`${tag}	coverage check answered ${list.status || "no network"}; posting without it`);
+  const done = new Set(item.done ?? []);
+  if (!coverage.complete && done.size > 0) {
+    logRefusal(`${tag}	part of this run already landed and coverage is unknown; kept for a sweep that can ask`);
+    return false;
   }
-  let start = item.start_time;
-  let trimmed = false;
+  let settled = true;
+  for (const [segStart, segEnd] of segments) {
+    if (done.has(`${segStart}|${segEnd}`)) {
+      continue;
+    }
+    const outcome = await postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we);
+    if (outcome === "kept") settled = false;
+    else done.add(`${segStart}|${segEnd}`);
+  }
+  item.done = [...done].sort();
+  return settled;
+}
+function isWhole(segments, ws, we) {
+  const only = segments.length === 1 ? segments[0] : void 0;
+  return only !== void 0 && Date.parse(only[0]) === ws && Date.parse(only[1]) === we;
+}
+async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we) {
+  let start = segStart;
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const whole = Date.parse(start) === ws && Date.parse(segEnd) === we;
+    const meters = whole ? { runtimeMin: item.agent_runtime_min, waitMin: item.agent_wait_min } : item.marks ? metersFor(item.marks, start, segEnd) : void 0;
     const body = buildEntryBody({
       project_id: projectId,
       label: item.label,
       start_time: start,
-      end_time: item.end_time,
+      end_time: segEnd,
       session_ref: item.session_ref,
-      idempotency_key: item.idempotency_key,
-      agent_runtime_min: trimmed ? void 0 : item.agent_runtime_min,
-      agent_wait_min: trimmed ? void 0 : item.agent_wait_min
+      // A segment is keyed on ITS start instant, like a run: two segments of
+      // one run must not replay each other.
+      idempotency_key: whole ? item.idempotency_key : `${item.session}:${start}`,
+      agent_runtime_min: meters?.runtimeMin,
+      agent_wait_min: meters?.waitMin,
+      prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : void 0
     });
     const res = await http("POST", `${cfg.apiUrl}/api/v1/entries`, {
       apiKey: cfg.apiKey,
@@ -596,27 +841,39 @@ async function deliver(item, cfg, projectsCache = {}) {
       session: item.session,
       body
     });
+    if (res.status > 0) item.contacted = true;
     if (res.status >= 200 && res.status < 300) {
-      if (isRecord(res.json)) return true;
-      logRefusal(`${tag}	${res.status} without an entry body, kept for retry`);
-      return false;
+      if (!isRecord(res.json)) {
+        logRefusal(`${tag}	${res.status} without an entry body, kept for retry`);
+        return "kept";
+      }
+      const gotStart = typeof res.json.start_time === "string" ? Date.parse(res.json.start_time) : Number.NaN;
+      const gotEnd = typeof res.json.end_time === "string" ? Date.parse(res.json.end_time) : Number.NaN;
+      if (Number.isFinite(gotStart) && Number.isFinite(gotEnd) && (Math.abs(gotStart - Date.parse(start)) > 1e3 || Math.abs(gotEnd - Date.parse(segEnd)) > 1e3)) {
+        logRefusal(`${tag}	${res.status} replayed an existing entry with a different window (${res.json.start_time}..${res.json.end_time}); ${start}..${segEnd} kept for retry`);
+        return "kept";
+      }
+      return "posted";
     }
     if (res.status === 409 && attempt === 0) {
       const free = earliestFreeStart(isRecord(res.json) ? res.json.message : void 0);
-      if (free && Date.parse(free) > Date.parse(start) && Date.parse(item.end_time) - Date.parse(free) >= 6e4) {
+      if (free && Date.parse(free) > Date.parse(start) && Date.parse(segEnd) - Date.parse(free) >= 6e4) {
         start = free;
-        trimmed = true;
         continue;
       }
     }
     if (isFinalRefusal(res.status)) {
+      if (res.status === 400 && (item.tries ?? 0) < 1) {
+        logRefusal(`${tag}	400 on the first attempt, kept for one retry	${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
+        return "kept";
+      }
       logRefusal(`${tag}	${res.status}	${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
-      return true;
+      return "final";
     }
-    logRefusal(`${tag}	${res.status || "no network"}	kept for retry`);
-    return false;
+    logRefusal(`${tag}	${res.status || "no network"}	kept for retry${res.status ? "" : `	${res.text.replace(/\s+/g, " ").slice(0, 200)}`}`);
+    return "kept";
   }
-  return false;
+  return "kept";
 }
 function coerceSpoolItem(value) {
   if (!isRecord(value)) return null;
@@ -626,6 +883,7 @@ function coerceSpoolItem(value) {
   if (!session || !start || !end) return null;
   const agent = typeof value.agent === "string" && value.agent ? value.agent : "claude";
   const minutes = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : void 0;
+  const marks = Array.isArray(value.marks) ? value.marks.flatMap((m) => isRecord(m) && typeof m.t === "number" && Number.isFinite(m.t) ? [{ t: m.t, k: typeof m.k === "string" ? m.k : "tool" }] : []) : void 0;
   return {
     agent,
     label: typeof value.label === "string" && value.label ? value.label : labelFor(agent),
@@ -637,9 +895,14 @@ function coerceSpoolItem(value) {
     agent_runtime_min: minutes(value.agent_runtime_min),
     agent_wait_min: minutes(value.agent_wait_min),
     idempotency_key: typeof value.idempotency_key === "string" && value.idempotency_key ? value.idempotency_key : `${session}:${start}`,
-    session_ref: typeof value.session_ref === "string" ? value.session_ref : session
+    session_ref: typeof value.session_ref === "string" ? value.session_ref : session,
+    ...marks ? { marks } : {},
+    ...Array.isArray(value.done) ? { done: value.done.filter((d) => typeof d === "string") } : {},
+    ...typeof value.created === "string" ? { created: value.created } : {},
+    ...typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {}
   };
 }
+var MAX_TRIES = 20;
 async function cmdFlush(cfg) {
   const dir = spoolDir();
   const cache = {};
@@ -658,11 +921,6 @@ async function cmdFlush(cfg) {
     try {
       const stat = statSync(path);
       if (!stat.isFile()) continue;
-      if (stat.mtimeMs < weekAgo) {
-        logRefusal(`${name}	pruned: undeliverable for 7 days`);
-        unlinkSync(path);
-        continue;
-      }
       let text;
       try {
         text = readFileSync(path, "utf8");
@@ -680,11 +938,44 @@ async function cmdFlush(cfg) {
       }
       const item = coerceSpoolItem(parsed);
       if (!item) {
-        logRefusal(`${name}	shape not recognized by runtime ${VERSION}, kept`);
+        if (stat.mtimeMs < weekAgo) {
+          logRefusal(`${name}	pruned: shape not recognized by any sweep for 7 days`);
+          unlinkSync(path);
+        } else {
+          logRefusal(`${name}	shape not recognized by runtime ${VERSION}, kept`);
+        }
         continue;
       }
-      if (await deliver(item, cfg, cache)) unlinkSync(path);
+      const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
+      const age = Number.isFinite(createdMs) ? createdMs : stat.mtimeMs;
+      if (age < weekAgo && (item.tries ?? 0) >= 1 || !item.created && (item.tries ?? 0) >= MAX_TRIES) {
+        logRefusal(`${name}	pruned: kept for retry ${item.tries} time(s)${age < weekAgo ? " over 7 days" : ""}`);
+        unlinkSync(path);
+        continue;
+      }
+      const before = JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 });
+      if (await deliver(item, cfg, cache)) {
+        try {
+          unlinkSync(path);
+        } catch (err) {
+          if (err.code !== "ENOENT") throw err;
+          logRefusal(`${name}	removed by a concurrent sweep`);
+        }
+      } else {
+        if (item.contacted) item.tries = (item.tries ?? 0) + 1;
+        if (JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 }) !== before) {
+          try {
+            if (existsSync(path)) writeAtomic(path, JSON.stringify({ ...JSON.parse(text), done: item.done, tries: item.tries }), 384);
+          } catch (err) {
+            logRefusal(`${name}	could not record the sweep's result: ${errorMessage(err)}`);
+          }
+        }
+      }
     } catch (err) {
+      if (err.code === "ENOENT") {
+        logRefusal(`${name}	removed by a concurrent sweep`);
+        continue;
+      }
       logRefusal(`${name}	delivery threw, kept for retry: ${errorMessage(err)}`);
     }
   }
@@ -783,7 +1074,9 @@ outcome description, \`agent_label\` naming this agent, \`session_ref\`, and an
 \`end_time\` may never be past the clock; never round \`start_time\` down
 (copy the previous entry's \`end_time\`); on a 409, retry once with the
 earliest free start it names. The hooks record the session as a backstop
-and stand down when your entry already covers the window.
+and stand down for the minutes your entries already cover. Parallel sessions
+APPORTION a person's time; they do not each claim it: if two sessions ran
+side by side, log the person's time once, to one project, or split it.
 `;
 function upsertBlock(path, block, marker) {
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
@@ -791,7 +1084,14 @@ function upsertBlock(path, block, marker) {
   writeUserFile(path, `${existing.trimEnd()}${existing ? "\n\n" : ""}${block}`);
   return true;
 }
-function installCodex(home = homedir(), scriptPath) {
+function installOrigin(argv) {
+  const flag = argv.find((a) => a.startsWith("--api-url="));
+  if (!flag) return DEFAULT_API_URL;
+  const url = validApiUrl(flag.slice("--api-url=".length));
+  if (!url) throw new Error(`--api-url must be an https origin with no path (got ${JSON.stringify(flag.slice("--api-url=".length))})`);
+  return url;
+}
+function installCodex(home = homedir(), scriptPath, apiUrl = DEFAULT_API_URL) {
   const dir = ensureDir(join(home, ".codex"));
   const hooksPath = join(dir, "hooks.json");
   const merged = mergeHooks(readUserJson(hooksPath), claudeShapedHooks("codex", scriptPath, { SessionEnd: 3 }));
@@ -803,7 +1103,7 @@ function installCodex(home = homedir(), scriptPath) {
   if (!/^\[mcp_servers\.shyre\]/m.test(toml)) {
     const block = `
 [mcp_servers.shyre]
-url = "${readConfig().apiUrl}/api/mcp"
+url = "${apiUrl}/api/mcp"
 bearer_token_env_var = "SHYRE_API_KEY"
 `;
     writeUserFile(tomlPath, `${toml.trimEnd()}
@@ -827,7 +1127,7 @@ function postInstallNotes(agent) {
   if (agent === "codex" || agent === "cursor") return POST_INSTALL_NOTES[agent];
   return [];
 }
-function installCursor(home = homedir(), scriptPath) {
+function installCursor(home = homedir(), scriptPath, apiUrl = DEFAULT_API_URL) {
   const dir = ensureDir(join(home, ".cursor"));
   const hooksPath = join(dir, "hooks.json");
   const mcpPath = join(dir, "mcp.json");
@@ -841,7 +1141,7 @@ function installCursor(home = homedir(), scriptPath) {
   const changed = [hooksPath];
   if (!servers.shyre) {
     servers.shyre = {
-      url: `${readConfig().apiUrl}/api/mcp`,
+      url: `${apiUrl}/api/mcp`,
       headers: { Authorization: "Bearer ${SHYRE_API_KEY}" }
     };
     writeUserFile(mcpPath, `${JSON.stringify(mcp, null, 2)}
@@ -856,58 +1156,203 @@ description: Log your own time to Shyre
 alwaysApply: true
 ---
 
-${CONVENTION}`);
+${CONVENTION}`, 420);
     changed.push(rulePath);
   }
   return changed;
 }
-function cmdInstall(agent) {
+function withoutOurHooks(existing) {
+  const out = { ...existing };
+  const prevHooks = isRecord(out.hooks) ? { ...out.hooks } : {};
+  let changed = false;
+  for (const [event, entries] of Object.entries(prevHooks)) {
+    if (!Array.isArray(entries)) continue;
+    const kept = entries.filter((e) => !isOurEntry(e));
+    if (kept.length !== entries.length) changed = true;
+    if (kept.length === 0) delete prevHooks[event];
+    else prevHooks[event] = kept;
+  }
+  out.hooks = prevHooks;
+  return { file: out, changed };
+}
+function withoutBlock(text, marker) {
+  const at = text.indexOf(marker);
+  if (at < 0) return null;
+  const rest = text.slice(at + marker.length);
+  const next = rest.search(/\n## /);
+  const after = next < 0 ? "" : rest.slice(next + 1);
+  return `${text.slice(0, at).trimEnd()}${after ? `
+
+${after}` : "\n"}`;
+}
+function uninstallCodex(home = homedir()) {
+  const dir = join(home, ".codex");
+  const changed = [];
+  const hooksPath = join(dir, "hooks.json");
+  if (existsSync(hooksPath)) {
+    const { file, changed: did } = withoutOurHooks(readUserJson(hooksPath));
+    if (did) {
+      writeUserFile(hooksPath, `${JSON.stringify(file, null, 2)}
+`);
+      changed.push(hooksPath);
+    }
+  }
+  const tomlPath = join(dir, "config.toml");
+  if (existsSync(tomlPath)) {
+    const toml = readFileSync(tomlPath, "utf8");
+    const stripped = toml.replace(/\n?\[mcp_servers\.shyre\][^[]*/m, "\n");
+    if (stripped !== toml) {
+      writeUserFile(tomlPath, `${stripped.trimEnd()}
+`);
+      changed.push(tomlPath);
+    }
+  }
+  const agentsPath = join(dir, "AGENTS.md");
+  if (existsSync(agentsPath)) {
+    const without = withoutBlock(readFileSync(agentsPath, "utf8"), "## Shyre \u2014 log your own time");
+    if (without !== null) {
+      writeUserFile(agentsPath, without, 420);
+      changed.push(agentsPath);
+    }
+  }
+  return changed;
+}
+function uninstallCursor(home = homedir()) {
+  const dir = join(home, ".cursor");
+  const changed = [];
+  const hooksPath = join(dir, "hooks.json");
+  if (existsSync(hooksPath)) {
+    const { file, changed: did } = withoutOurHooks(readUserJson(hooksPath));
+    if (did) {
+      writeUserFile(hooksPath, `${JSON.stringify(file, null, 2)}
+`);
+      changed.push(hooksPath);
+    }
+  }
+  const mcpPath = join(dir, "mcp.json");
+  if (existsSync(mcpPath)) {
+    const mcp = readUserJson(mcpPath);
+    const servers = isRecord(mcp.mcpServers) ? { ...mcp.mcpServers } : null;
+    if (servers && servers.shyre !== void 0) {
+      delete servers.shyre;
+      mcp.mcpServers = servers;
+      writeUserFile(mcpPath, `${JSON.stringify(mcp, null, 2)}
+`);
+      changed.push(mcpPath);
+    }
+  }
+  const rulePath = join(dir, "rules", "shyre.mdc");
+  if (existsSync(rulePath)) {
+    unlinkSync(rulePath);
+    changed.push(rulePath);
+  }
+  return changed;
+}
+function cmdInstall(agent, opts = { apiUrl: DEFAULT_API_URL, uninstall: false }) {
+  if (opts.uninstall) {
+    if (agent === "codex") return uninstallCodex(homedir());
+    if (agent === "cursor") return uninstallCursor(homedir());
+    if (agent === "claude") throw new Error("Claude Code uninstalls through the plugin: claude plugin uninstall shyre");
+    throw new Error(`no uninstaller for "${agent ?? ""}" (supported: codex, cursor)`);
+  }
   const scriptPath = installRuntimeCopy();
-  if (agent === "codex") return installCodex(homedir(), scriptPath);
-  if (agent === "cursor") return installCursor(homedir(), scriptPath);
+  if (agent === "codex") return installCodex(homedir(), scriptPath, opts.apiUrl);
+  if (agent === "cursor") return installCursor(homedir(), scriptPath, opts.apiUrl);
   if (agent === "claude") {
     throw new Error("Claude Code installs through the plugin: claude plugin install shyre@theshyre");
   }
   throw new Error(`no installer for "${agent ?? ""}" yet (supported: codex, cursor; Claude Code uses the plugin)`);
 }
-function cmdDoctor() {
-  const cfg = readConfig();
-  const configPath = join(shyreHome(), "config.json");
-  let configNote = "none";
-  if (existsSync(configPath)) {
-    const mode = statSync(configPath).mode & 511;
-    configNote = mode & 63 ? `present \u2014 WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600";
+async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFAULT_API_URL) {
+  const lines = [`shyre-hook ${VERSION}`, `home: ${shyreHome()}`];
+  const attempt = (label, fn) => {
+    try {
+      lines.push(fn());
+    } catch (err) {
+      lines.push(`${label}: could not be read (${errorMessage(err)})`);
+    }
+  };
+  attempt("api", () => `api: ${cfg.apiUrl}${cfg.apiUrl === DEFAULT_API_URL ? "" : `   WARNING: not the default ${DEFAULT_API_URL} \u2014 set by SHYRE_API_URL or ~/.shyre/config.json; the token is sent here`}`);
+  attempt("token", () => `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}\u2026)` : "MISSING \u2014 export SHYRE_API_KEY or write ~/.shyre/config.json"}`);
+  attempt("config file", () => {
+    const configPath = join(shyreHome(), "config.json");
+    const mode = modeOf(configPath);
+    if (mode === void 0) return "config file: none";
+    return `config file: ${mode & 63 ? `present \u2014 WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600"}`;
+  });
+  attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
+  attempt("tls", () => process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 \u2014 the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on");
+  const remote = gitRemote(cwd);
+  const repoKey = repoKeyFromRemote(remote);
+  const mapFile = readMapFileFrom();
+  attempt("repo", () => `repo: ${cwd} \u2192 ${remote ?? "no git remote"} \u2192 ${repoKey ?? "no repo key"}`);
+  attempt("map", () => {
+    if (!mapFile) return "map: none (server github_repo fallback only)";
+    const hit = repoKey ? resolveFromMap(mapFile.map, repoKey) : null;
+    const dflt = isRecord(mapFile.map) && typeof mapFile.map._default === "string" ? ` (a _default routes unmapped repos to ${mapFile.map._default})` : "";
+    return `map: ${mapFile.path}${dflt} \u2192 ${hit ? `this repo \u2192 ${hit}` : "this repo is not in it"}`;
+  });
+  if (cfg.apiKey && !probe) {
+    lines.push(`server: not asked \u2014 the origin is not the default; run doctor --probe to send the token to ${cfg.apiUrl}`);
+  } else if (cfg.apiKey) {
+    try {
+      const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: "claude", session: "doctor" });
+      const rows = res.status === 200 ? toProjectRows(res.json) : null;
+      if (rows) {
+        const hit = repoKey ? rows.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === repoKey) : void 0;
+        lines.push(`server: ${res.status}, ${rows.length} project(s)${repoKey ? `; ${hit ? `github_repo names this repo \u2192 ${hit.id}` : "NO project's github_repo names this repo \u2014 sessions here will be kept, then pruned"}` : ""}`);
+      } else {
+        lines.push(`server: ${res.status === 401 ? "401 \u2014 the token is refused (revoked, expired, offboarded, or the team's integrations are off); re-mint it" : `${res.status || "no network"} \u2014 ${res.text.replace(/\s+/g, " ").slice(0, 120)}`}`);
+      }
+    } catch (err) {
+      lines.push(`server: could not be asked (${errorMessage(err)})`);
+    }
+  } else {
+    lines.push("server: not asked (no token)");
   }
-  const spoolItems = readdirSync(spoolDir()).filter((n) => n.endsWith(".json"));
-  const oldest = spoolItems.reduce((acc, n) => Math.min(acc, statSync(join(spoolDir(), n)).mtimeMs), Date.now());
-  const lines = [
-    `shyre-hook ${VERSION}`,
-    `home: ${shyreHome()}`,
-    `api: ${cfg.apiUrl}`,
-    // Only the prefix and four characters: doctor output ends up in issues.
-    `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}\u2026)` : "MISSING \u2014 export SHYRE_API_KEY or write ~/.shyre/config.json"}`,
-    `config file: ${configNote}`,
-    `idle cap: ${cfg.idleCapSeconds}s`,
-    `map: ${readMapFile() ? "found" : "none (server github_repo fallback only)"}`,
-    `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest ${Math.round((Date.now() - oldest) / 36e5)} h; pruned after 7 days)` : ""}`,
-    `sessions: ${readdirSync(sessionsDir()).filter((n) => n.endsWith(".meta.json")).length} open`,
-    `tmpdir (legacy shell kit state, not used): ${tmpdir()}`
-  ];
+  attempt("spool", () => {
+    const dir = spoolDir();
+    const spoolItems = readdirSync(dir).filter((n) => n.endsWith(".json"));
+    const oldest = spoolItems.reduce((acc, n) => Math.min(acc, statSync(join(dir, n)).mtimeMs), Date.now());
+    return `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest ${Math.round((Date.now() - oldest) / 36e5)} h; pruned after 7 days once tried)` : ""}`;
+  });
+  attempt("sessions", () => {
+    const dir = sessionsDir();
+    const names = readdirSync(dir);
+    const open = names.filter((n) => n.endsWith(".meta.json")).length;
+    const newest = names.filter((n) => n.endsWith(".marks")).reduce((acc, n) => Math.max(acc, statSync(join(dir, n)).mtimeMs), 0);
+    return `sessions: ${open} open; last mark recorded: ${newest ? new Date(newest).toISOString() : "never (no session has written a mark; if an agent is running, its hook is not firing or its payload is not read \u2014 see refusals)"}`;
+  });
+  attempt("refusals", () => {
+    const path = refusalLogPath();
+    if (!existsSync(path)) return `refusals: none logged (${path})`;
+    const all = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+    const last = (all[all.length - 1] ?? "").replace(/shyre_pat_[A-Za-z0-9_-]+/g, "shyre_pat_[REDACTED]");
+    return `refusals: ${all.length} line(s) in ${path}; last: ${last.slice(0, 200)}`;
+  });
+  return lines;
+}
+async function cmdDoctor(argv = []) {
+  const cfg = readConfig();
+  const lines = await doctorLines(cfg, process.cwd(), cfg.apiUrl === DEFAULT_API_URL || argv.includes("--probe"));
   process.stdout.write(`${lines.join("\n")}
 `);
 }
 var INTERACTIVE = /* @__PURE__ */ new Set(["install", "doctor"]);
 async function main(argv) {
-  const [first, second, third] = argv;
+  const positional = argv.filter((a) => !a.startsWith("--"));
+  const [first, second, third] = positional;
   const cfg = readConfig();
   if (first === "flush") return cmdFlush(cfg);
-  if (first === "doctor") return cmdDoctor();
+  if (first === "doctor") return cmdDoctor(argv);
   if (first === "install") {
-    const changed = cmdInstall(second);
-    const notes = postInstallNotes(second);
+    const uninstall = argv.includes("--uninstall");
+    const apiUrl = installOrigin(argv);
+    const changed = cmdInstall(second, { apiUrl, uninstall });
+    const notes = uninstall ? [] : postInstallNotes(second);
     process.stdout.write(
-      `shyre: configured ${second ?? ""}
-${changed.map((p) => `  ${p}`).join("\n")}
+      `shyre: ${uninstall ? "removed from" : "configured"} ${second ?? ""}${uninstall ? "" : ` \u2014 API origin ${apiUrl}`}
+${changed.length ? changed.map((p) => `  ${p}`).join("\n") : "  (nothing to change)"}
 ` + (notes.length ? `
 Next:
 ${notes.map((n) => `  - ${n}`).join("\n")}
@@ -947,9 +1392,15 @@ if (invokedDirectly()) {
 }
 export {
   AGENT_LABELS,
+  COVERAGE_MAX_PAGES,
+  COVERAGE_PAGE_SIZE,
   DEFAULT_API_URL,
   HOOK_WIRING,
+  MAX_IDLE_CAP_SECONDS,
+  MAX_TRIES,
   POST_INSTALL_NOTES,
+  PROMPT_MARKS_MAX,
+  STDIN_MAX_BYTES,
   VERSION,
   buildEntryBody,
   claudeShapedHooks,
@@ -961,20 +1412,31 @@ export {
   cursorHooks,
   deliver,
   detectAgent,
+  doctorLines,
   earliestFreeStart,
+  fetchCoverage,
+  gitRemote,
   installCodex,
   installCursor,
+  installOrigin,
   isAgent,
   logRefusal,
   main,
+  mapFileCandidates,
+  metersFor,
   nodeCommand,
   normalizePayload,
   parseMarks,
+  promptMarksFor,
   readConfig,
+  refusalLogPath,
   repoKeyFromRemote,
   resolveFromMap,
   segmentRuns,
   shyreHome,
-  validApiUrl,
-  windowCovered
+  uncoveredMillis,
+  uncoveredSegments,
+  uninstallCodex,
+  uninstallCursor,
+  validApiUrl
 };

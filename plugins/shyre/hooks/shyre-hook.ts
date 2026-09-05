@@ -35,11 +35,13 @@
  *   thrown away (a 13-hour session logged 91 minutes). `start` here APPENDS a
  *   mark when state already exists.
  *
- * • One entry per RUN of activity, with real timestamps. The shell kit posted
+ * • One entry per RUN of activity, with real timestamps — split only where
+ *   your own entries already cover part of it. The shell kit posted
  *   `[session start, session start + active]`, which for a multi-day session
  *   fabricated one contiguous window on day one. A run is a stretch of marks
- *   with no gap over the idle cap; each run becomes one entry with its true
- *   start and end. Nothing is bridged, nothing is invented.
+ *   with no gap over the idle cap; each run becomes an entry with its true
+ *   start and end, or one entry per uncovered stretch of it. Nothing is
+ *   bridged, nothing is invented.
  *
  * • SessionEnd does no network. Claude Code gives SessionEnd hooks 1.5 s
  *   shared; Codex gives 1 s and ignores `async`. `end` writes spool files and
@@ -61,6 +63,30 @@
  * • Both meters (agent_runtime_min / agent_wait_min) are computed from the
  *   beat tags: a gap that STARTS at `stop` is the agent waiting on the human;
  *   any other gap is the machine working. runtime + wait == active, exactly.
+ *
+ * • The stand-down is by the MINUTE, across ALL of your projects. Before
+ *   posting, the runtime lists your entries on every project — paging with
+ *   `until` until it has every entry that starts before the run ends, plus
+ *   the running timer — and posts only the parts of the run no entry already
+ *   covers, with the meters recomputed for each part from the run's own
+ *   marks. A page that cannot be fetched, a body that is not a list, or a
+ *   list still truncated after ten pages is "coverage unknown": the run is
+ *   posted and the log says so. The first cut asked one project, one page,
+ *   and stood the whole run down on any overlap: a hook entry on the child
+ *   project landed under the agent's own entries on the parent, and one
+ *   afternoon was written down twice under two names.
+ *
+ * • A partly delivered run remembers what landed. Each settled stretch's
+ *   start is written back to the spool item (`done`), so a later sweep never
+ *   re-posts it — and never posts the whole window under the first stretch's
+ *   key, which the server would answer with that stretch as an idempotent
+ *   replay and the rest of the run would be lost. A 2xx whose entry has a
+ *   different window than the one posted is treated as exactly that replay
+ *   and the stretch is kept.
+ *
+ * • The tenth field: prompt_marks, the instants you sent a prompt inside the
+ *   run. Timestamps only — no prompt text, no diff, no file names. The day
+ *   view uses them to suggest how an overlap between two sessions splits.
  */
 
 import { spawn, execFileSync } from "node:child_process";
@@ -77,11 +103,11 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.0.2";
+export const VERSION = "1.1.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -151,6 +177,8 @@ export interface Run {
   runtimeMin: number;
   waitMin: number;
   index: number;
+  /** The run's own marks, kept so a partly covered run can be re-metered. */
+  marks: Mark[];
 }
 
 export interface Meta {
@@ -182,6 +210,18 @@ export interface SpoolItem {
   idempotency_key: string;
   session_ref: string;
   created?: string;
+  /** Sweeps that reached the server about this item and kept it. */
+  tries?: number;
+  /** In memory only: this sweep got an answer from the server about this item. */
+  contacted?: boolean;
+  /** The run's marks, LOCAL ONLY: never sent as such. Absent on items an
+   *  older runtime wrote; such an item is posted on what it has. */
+  marks?: Mark[];
+  /** The stretches of this run that already settled — posted, or refused
+   *  for good — as `start|end`, written back by the flush so a later sweep
+   *  skips exactly them. A longer stretch from the same start is a different
+   *  stretch. */
+  done?: string[];
 }
 
 export interface EntryBodyInput {
@@ -193,9 +233,10 @@ export interface EntryBodyInput {
   idempotency_key: string;
   agent_runtime_min?: number | undefined;
   agent_wait_min?: number | undefined;
+  prompt_marks?: string[] | undefined;
 }
 
-/** The nine fields the server receives, and nothing else. */
+/** The ten fields the server receives, and nothing else. */
 export interface EntryBody {
   project_id: string;
   start_time: string;
@@ -206,6 +247,9 @@ export interface EntryBody {
   idempotency_key: string;
   agent_runtime_min: number | undefined;
   agent_wait_min: number | undefined;
+  /** Instants a prompt was sent inside the window. Absent when the item
+   *  carries no marks (an older spool item), never invented. */
+  prompt_marks: string[] | undefined;
 }
 
 type Env = Record<string, string | undefined>;
@@ -218,11 +262,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/** A day: no run may be longer than the server's per-entry maximum anyway. */
+export const MAX_IDLE_CAP_SECONDS = 86_400;
+
 export function shyreHome(): string {
   return process.env.SHYRE_HOME || join(homedir(), ".shyre");
 }
 
-export const DEFAULT_API_URL = "https://shyre.malcom.io";
+export const DEFAULT_API_URL = "https://shyre.io";
 
 /**
  * The API origin is written into the user's MCP configs and receives the
@@ -266,7 +313,9 @@ export function readConfig(env: Env = process.env): Config {
   const apiKey = env.SHYRE_API_KEY || fileKey;
   const apiUrl = validApiUrl(env.SHYRE_API_URL || fileUrl) || DEFAULT_API_URL;
   const cap = Number(env.SHYRE_IDLE_CAP_SECONDS || fileCap || 900);
-  return { apiKey, apiUrl, idleCapSeconds: Number.isFinite(cap) && cap > 0 ? cap : 900 };
+  // Bounded above as well as below: a cap of 1e9 would turn elapsed span
+  // into "active time", which is the one thing the meter must never do.
+  return { apiKey, apiUrl, idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900 };
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +331,7 @@ export function readConfig(env: Env = process.env): Config {
 export function repoKeyFromRemote(remote: unknown): string | null {
   if (!remote) return null;
   const key = String(remote)
+    .replace(/[\r\n\t]+/g, "")
     .trim()
     .replace(/^[a-z+]+:\/\/[^/]+\//i, "")
     .replace(/^[^@]+@[^:]+:/, "")
@@ -401,6 +451,7 @@ export function segmentRuns(marks: readonly Mark[], capSeconds: number): Run[] {
         runtimeMin: Math.floor(runtime / 60000),
         waitMin: Math.floor(wait / 60000),
         index: runs.length + 1,
+        marks: sorted.slice(i, j + 1),
       });
     }
     i = j + 1;
@@ -408,7 +459,7 @@ export function segmentRuns(marks: readonly Mark[], capSeconds: number): Run[] {
   return runs;
 }
 
-/** The nine fields the server receives, and nothing else. */
+/** The ten fields the server receives, and nothing else. */
 export function buildEntryBody(item: EntryBodyInput): EntryBody {
   return {
     project_id: item.project_id,
@@ -420,26 +471,126 @@ export function buildEntryBody(item: EntryBodyInput): EntryBody {
     idempotency_key: item.idempotency_key,
     agent_runtime_min: item.agent_runtime_min,
     agent_wait_min: item.agent_wait_min,
+    prompt_marks: item.prompt_marks,
   };
 }
 
+/** A half-open window as a pair of ISO instants (seconds precision). */
+export type Segment = readonly [start: string, end: string];
+
 /**
- * Does any existing entry overlap [start, end)? Mirrors the server's guard:
- * strict inequalities (touching windows are legal) and a running timer
- * (`end_time` null) reads as open through now. An entry with an unparseable
- * date is skipped; the server's guard is the backstop.
+ * The parts of [start, end) that NO existing entry covers, each at least a
+ * minute long. Mirrors the server's overlap predicate — strict inequalities,
+ * so touching windows are legal, and a running timer (`end_time` null) reads
+ * as open through now — but answers by the minute rather than yes/no: a run
+ * partly covered by your own per-unit entry posts its uncovered remainder,
+ * never the whole run and never nothing. An entry with an unparseable date is
+ * skipped; the server's guard is the backstop.
  */
-export function windowCovered(entries: unknown, start: string, end: string, nowIso: string = new Date().toISOString()): boolean {
+export function uncoveredSegments(entries: unknown, start: string, end: string, nowIso: string = new Date().toISOString()): Segment[] {
   const ws = Date.parse(start);
   const we = Date.parse(end);
   const now = Date.parse(nowIso);
-  if (!Array.isArray(entries)) return false;
-  return entries.some((e: unknown) => {
-    if (!isRecord(e)) return false;
-    const s = typeof e.start_time === "string" ? Date.parse(e.start_time) : Number.NaN;
-    const en = typeof e.end_time === "string" ? Date.parse(e.end_time) : e.end_time ? Number.NaN : now;
-    return Number.isFinite(s) && Number.isFinite(en) && s < we && en > ws;
-  });
+  if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) return [];
+  const covered: Array<[number, number]> = [];
+  if (Array.isArray(entries)) {
+    for (const e of entries as unknown[]) {
+      if (!isRecord(e)) continue;
+      const s = typeof e.start_time === "string" ? Date.parse(e.start_time) : Number.NaN;
+      // A running timer is open through now — but the server refuses any
+      // entry over 24 h, so a timer left running for days can never become an
+      // entry covering those days; it covers a day at most.
+      const en = typeof e.end_time === "string" ? Date.parse(e.end_time) : e.end_time ? Number.NaN : Math.min(now, s + 86_400_000);
+      if (Number.isFinite(s) && Number.isFinite(en) && s < we && en > ws) covered.push([Math.max(s, ws), Math.min(en, we)]);
+    }
+  }
+  covered.sort((a, b) => a[0] - b[0]);
+  const out: Segment[] = [];
+  let cursor = ws;
+  for (const [s, en] of covered) {
+    if (s > cursor && s - cursor >= 60000) out.push([isoSeconds(cursor), isoSeconds(s)]);
+    cursor = Math.max(cursor, en);
+  }
+  if (we > cursor && we - cursor >= 60000) out.push([isoSeconds(cursor), isoSeconds(we)]);
+  return out;
+}
+
+/** Milliseconds of [start, end) no entry covers, floor or no floor — for saying what was dropped. */
+export function uncoveredMillis(entries: unknown, start: string, end: string, nowIso: string = new Date().toISOString()): number {
+  const ws = Date.parse(start);
+  const we = Date.parse(end);
+  const now = Date.parse(nowIso);
+  if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) return 0;
+  const covered: Array<[number, number]> = [];
+  if (Array.isArray(entries)) {
+    for (const e of entries as unknown[]) {
+      if (!isRecord(e)) continue;
+      const s = typeof e.start_time === "string" ? Date.parse(e.start_time) : Number.NaN;
+      const en = typeof e.end_time === "string" ? Date.parse(e.end_time) : e.end_time ? Number.NaN : Math.min(now, s + 86_400_000);
+      if (Number.isFinite(s) && Number.isFinite(en) && s < we && en > ws) covered.push([Math.max(s, ws), Math.min(en, we)]);
+    }
+  }
+  covered.sort((a, b) => a[0] - b[0]);
+  let cursor = ws;
+  let uncovered = 0;
+  for (const [s, en] of covered) {
+    if (s > cursor) uncovered += s - cursor;
+    cursor = Math.max(cursor, en);
+  }
+  if (we > cursor) uncovered += we - cursor;
+  return uncovered;
+}
+
+/**
+ * The two meters for one window of a run, from the run's own marks: each
+ * gap between consecutive marks is clipped to the window and charged to
+ * `wait` when it starts at `stop`, to `runtime` otherwise — the same rule as
+ * segmentRuns, so on the whole run the two agree exactly.
+ */
+export function metersFor(marks: readonly Mark[], start: string, end: string): { runtimeMin: number; waitMin: number } {
+  const ws = Date.parse(start);
+  const we = Date.parse(end);
+  const sorted = [...marks].sort((a, b) => a.t - b.t);
+  let runtime = 0;
+  let wait = 0;
+  for (let i = 0; i + 1 < sorted.length; i += 1) {
+    const a = sorted[i];
+    const b = sorted[i + 1];
+    if (!a || !b) break;
+    const from = Math.max(a.t, ws);
+    const to = Math.min(b.t, we);
+    if (to <= from) continue;
+    if (a.k === "stop") wait += to - from;
+    else runtime += to - from;
+  }
+  return { runtimeMin: Math.floor(runtime / 60000), waitMin: Math.floor(wait / 60000) };
+}
+
+/** The server refuses a longer list — and drops the field, not the entry —
+ *  so the runtime sends at most this many. */
+export const PROMPT_MARKS_MAX = 2000;
+
+/**
+ * The prompt instants inside [start, end], as ISO seconds, ascending,
+ * de-duplicated to the second, at most PROMPT_MARKS_MAX of them. Over the
+ * cap the list is SAMPLED EVENLY, first and last kept: the marks exist so a
+ * resolver can see where in the window the prompts fell, and the earliest
+ * two thousand of a long run would all sit at its start and say the
+ * opposite of the truth.
+ */
+export function promptMarksFor(marks: readonly Mark[], start: string, end: string): string[] {
+  const ws = Date.parse(start);
+  const we = Date.parse(end);
+  const seconds = [...new Set(marks.filter((m) => m.k === "prompt" && m.t >= ws && m.t <= we).map((m) => Math.floor(m.t / 1000) * 1000))].sort((a, b) => a - b);
+  if (seconds.length <= PROMPT_MARKS_MAX) return seconds.map((t) => isoSeconds(t));
+  const out: string[] = [];
+  const last = seconds.length - 1;
+  for (let i = 0; i < PROMPT_MARKS_MAX; i += 1) {
+    const idx = Math.round((i * last) / (PROMPT_MARKS_MAX - 1));
+    const t = seconds[idx];
+    if (t !== undefined) out.push(isoSeconds(t));
+  }
+  return out;
 }
 
 /** The ISO instant an overlap refusal names as the earliest legal start, if any. */
@@ -482,9 +633,25 @@ function ensurePrivateDir(p: string): string {
   return p;
 }
 
+/** The mode a file has, or undefined when there is no file. */
+function modeOf(path: string): number | undefined {
+  try {
+    return statSync(path).mode & 0o777;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write through a temp file and rename. The rename would otherwise replace
+ * the target's mode with the umask default: a 600 config rewritten as 644
+ * (SAL-177 in the Shyre repo). So the existing mode is kept unless one is
+ * given.
+ */
 function writeAtomic(path: string, text: string, mode?: number): void {
+  const keep = mode ?? modeOf(path);
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, text, mode === undefined ? undefined : { mode });
+  writeFileSync(tmp, text, keep === undefined ? undefined : { mode: keep });
   renameSync(tmp, path);
 }
 
@@ -493,16 +660,18 @@ function writeAtomic(path: string, text: string, mode?: number): void {
  * pristine original and is never overwritten; later ones are timestamped, so
  * a second install cannot replace the original with its own first output.
  */
-function writeUserFile(path: string, text: string): void {
+function writeUserFile(path: string, text: string, defaultMode = 0o600): void {
+  const mode = modeOf(path) ?? defaultMode;
   if (existsSync(path)) {
     try {
+      // The backup carries the original's mode: a 600 file's copy is 600.
       const bak = existsSync(`${path}.bak`) ? `${path}.bak.${Date.now()}` : `${path}.bak`;
-      writeFileSync(bak, readFileSync(path));
+      writeFileSync(bak, readFileSync(path), { mode });
     } catch {
       /* a backup we could not take is not a reason to refuse the write */
     }
   }
-  writeAtomic(path, text);
+  writeAtomic(path, text, mode);
 }
 
 function sessionsDir(): string {
@@ -520,11 +689,29 @@ function stateBase(agent: string, session: string): string {
   return join(sessionsDir(), `${agent}-${safe}`);
 }
 
+/**
+ * Where the log may go: under the Shyre home, and nowhere else. An arbitrary
+ * path would make the hook a way to append a line to any file the user can
+ * write, with the fields a repository controls (its remote, its directory)
+ * in it. Anything outside falls back to the default.
+ */
+export function refusalLogPath(env: Env = process.env): string {
+  const fallback = join(shyreHome(), "refusals.log");
+  const raw = env.SHYRE_HOOK_LOG;
+  if (!raw) return fallback;
+  const home = resolve(shyreHome());
+  const target = resolve(raw);
+  return target.startsWith(`${home}${sep}`) ? target : fallback;
+}
+
 export function logRefusal(line: string): void {
   try {
-    const target = process.env.SHYRE_HOOK_LOG || join(shyreHome(), "refusals.log");
+    const target = refusalLogPath();
     ensureDir(join(target, ".."));
-    appendFileSync(target, `${new Date().toISOString()}\t${line}\n`);
+    // One record per line: a field a repository controls (its remote, its
+    // directory, the server's text) cannot forge a second line.
+    const flat = line.replace(/[\r\n]+/g, " ");
+    appendFileSync(target, `${new Date().toISOString()}\t${flat}\n`);
     try {
       chmodSync(target, 0o600);
     } catch {
@@ -535,23 +722,74 @@ export function logRefusal(line: string): void {
   }
 }
 
-function gitRemote(cwd: string): string | null {
+/**
+ * Say something at most once a minute per subject. A hook that receives a
+ * payload it cannot read fires on every tool call; one line a minute is
+ * enough to notice, a line per call would bury the log.
+ */
+function noteOncePerMinute(subject: string, line: string): void {
   try {
-    return execFileSync("git", ["-C", cwd, "remote", "get-url", "origin"], {
-      encoding: "utf8",
-      timeout: 3000,
-      stdio: ["ignore", "pipe", "ignore"],
-      windowsHide: true,
-    }).trim();
+    const marker = join(ensurePrivateDir(shyreHome()), `.said-${subject}`);
+    const last = modeOf(marker) === undefined ? 0 : statSync(marker).mtimeMs;
+    if (Date.now() - last < 60_000) return;
+    writeFileSync(marker, "", { mode: 0o600 });
+    logRefusal(line);
   } catch {
-    return null;
+    /* saying it is best effort */
   }
 }
 
-function readMapFile(): unknown {
-  for (const candidate of [join(shyreHome(), "projects.json"), join(homedir(), ".claude", "shyre-projects.json")]) {
+/** The keys a payload carried, for the note when none of them names a session. */
+function payloadKeys(raw: unknown): string {
+  return isRecord(raw) ? Object.keys(raw).slice(0, 12).join(",") || "(none)" : typeof raw;
+}
+
+/**
+ * The origin remote of the repository that contains `cwd`, or null. The
+ * lookup is by DIRECTORY, so an inherited GIT_DIR / GIT_WORK_TREE is
+ * dropped from git's environment: a hook fired from inside another git
+ * process (a pre-push hook, a rebase, an editor's git integration) inherits
+ * those, and with GIT_DIR set every directory on the machine resolves to
+ * that one repository — a session in a plain folder would be recorded
+ * against whatever repo the parent process was operating on.
+ */
+export function gitRemote(cwd: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const clean: NodeJS.ProcessEnv = { ...env };
+  for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete clean[k];
+  // `origin` first; `upstream` when there is no origin. A fork-based team
+  // clones its own fork as origin and adds the shared repo as upstream, and
+  // a session there is work on the shared project, not the fork.
+  for (const name of ["origin", "upstream"]) {
     try {
-      return JSON.parse(readFileSync(candidate, "utf8")) as unknown;
+      const url = execFileSync("git", ["-C", cwd, "remote", "get-url", name], {
+        encoding: "utf8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+        env: clean,
+      }).trim();
+      if (url) return url;
+    } catch {
+      /* try the next name */
+    }
+  }
+  return null;
+}
+
+/** The map files, in the order they are consulted. */
+export function mapFileCandidates(): string[] {
+  return [join(shyreHome(), "projects.json"), join(homedir(), ".claude", "shyre-projects.json")];
+}
+
+function readMapFile(): unknown {
+  return readMapFileFrom()?.map ?? null;
+}
+
+/** The first readable map file and its contents, so doctor can name it. */
+function readMapFileFrom(): { path: string; map: unknown } | null {
+  for (const candidate of mapFileCandidates()) {
+    try {
+      return { path: candidate, map: JSON.parse(readFileSync(candidate, "utf8")) as unknown };
     } catch {
       /* try the next */
     }
@@ -581,6 +819,11 @@ interface HttpOptions {
 }
 
 async function http(method: "GET" | "POST", url: string, { apiKey, agent, session, body }: HttpOptions): Promise<HttpResult> {
+  // A corporate proxy setup that disables certificate checks globally would
+  // have the hook hand the token to whatever presents a certificate.
+  if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && url.startsWith("https:")) {
+    return { status: 0, json: null, text: "refusing to send the token while NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate checks" };
+  }
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 10000);
   try {
@@ -623,12 +866,20 @@ function nowIso(): string {
   return isoSeconds(Date.now());
 }
 
+/** More than this is not a hook payload; the runtime needs a session id and a directory. */
+export const STDIN_MAX_BYTES = 4 * 1024 * 1024;
+
 function readStdin(): unknown {
   try {
     if (process.stdin.isTTY) return {};
     const text = readFileSync(0, "utf8");
+    if (text.length > STDIN_MAX_BYTES) {
+      noteOncePerMinute("stdin-size", `payload of ${text.length} bytes ignored: larger than ${STDIN_MAX_BYTES}`);
+      return {};
+    }
     return text.trim() ? (JSON.parse(text) as unknown) : {};
-  } catch {
+  } catch (err) {
+    noteOncePerMinute("stdin-json", `payload was not JSON, nothing recorded: ${errorMessage(err).slice(0, 120)}`);
     return {};
   }
 }
@@ -643,6 +894,12 @@ function detachedFlush(): void {
       stdio: "ignore",
       windowsHide: true,
     });
+    // EAGAIN under a heavy build, EPERM under a hardened profile, ENOENT after
+    // a node upgrade mid-session: delivered as an event, and an unhandled one
+    // is the one path out of "the hook never fails a session".
+    child.on("error", () => {
+      /* the spool is the durable record; a lost flush is retried next start */
+    });
     child.unref();
   } catch {
     /* the spool is the durable record; a lost flush is retried next start */
@@ -653,7 +910,10 @@ function detachedFlush(): void {
 export function cmdStart(argvAgent: string, payload: unknown): void {
   const agent = detectAgent(argvAgent, payload);
   const { session, cwd } = normalizePayload(payload);
-  if (!session) return;
+  if (!session) {
+    noteOncePerMinute("no-session", `${agent}\tstart payload names no session, nothing recorded; keys: ${payloadKeys(payload)}`);
+    return;
+  }
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) {
     const meta: Meta = {
@@ -673,7 +933,10 @@ export function cmdStart(argvAgent: string, payload: unknown): void {
 export function cmdBeat(argvAgent: string, payload: unknown, tag: string): void {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
-  if (!session) return;
+  if (!session) {
+    noteOncePerMinute("no-session", `${agent}\tbeat payload names no session, nothing recorded; keys: ${payloadKeys(payload)}`);
+    return;
+  }
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) cmdStart(agent, payload);
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
@@ -705,7 +968,10 @@ function coerceMeta(value: unknown, fallbackAgent: Agent, fallbackSession: strin
 export function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: Pick<Config, "idleCapSeconds">): void {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
-  if (!session) return;
+  if (!session) {
+    noteOncePerMinute("no-session", `${agent}\tend payload names no session, nothing recorded; keys: ${payloadKeys(payload)}`);
+    return;
+  }
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) return;
   let parsed: unknown;
@@ -742,6 +1008,7 @@ export function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: 
       end_time: run.end,
       agent_runtime_min: run.runtimeMin,
       agent_wait_min: run.waitMin,
+      marks: run.marks,
       // Keyed on the run's START INSTANT, not its ordinal: a session id is
       // reused across /clear and --resume, so "run 1" would recur, and the
       // server would answer the second with the FIRST entry as a replay —
@@ -777,6 +1044,7 @@ export interface ProjectsCache {
 }
 
 type Resolved = { id: string } | { id: null; reason: "unmapped" } | { id: null; reason: "lookup-failed"; status: number };
+/** `failed` codes that are not HTTP statuses: -1 no network, -2 an empty list. */
 
 function toProjectRows(value: unknown): ProjectRow[] | null {
   if (!Array.isArray(value)) return null;
@@ -808,16 +1076,20 @@ async function resolveProject(item: SpoolItem, cfg: Config, projectsCache: Proje
       agent: item.agent,
       session: item.session,
     });
+    if (res.status > 0) item.contacted = true;
     const rows = res.status === 200 ? toProjectRows(res.json) : null;
     // `|| -1`: no network reports status 0, which is falsy and would re-dial
-    // (and re-wait the full timeout) for every item in the sweep.
-    if (rows) projectsCache.list = rows;
-    else projectsCache.failed = res.status || -1;
+    // (and re-wait the full timeout) for every item in the sweep. An EMPTY
+    // list (-2) is not the fact "nothing names this repo" either: a token on
+    // the wrong team, or a filter the server added, reads as no projects, and
+    // settling every run as unmapped on it would delete them all.
+    if (rows && rows.length > 0) projectsCache.list = rows;
+    else projectsCache.failed = rows ? -2 : res.status || -1;
   }
   const list = projectsCache.list;
   if (!list) {
     const failed = projectsCache.failed ?? 0;
-    return { id: null, reason: "lookup-failed", status: failed > 0 ? failed : 0 };
+    return { id: null, reason: "lookup-failed", status: failed === -2 ? -2 : failed > 0 ? failed : 0 };
   }
   const hit = list.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === item.repo_key);
   return hit ? { id: hit.id } : { id: null, reason: "unmapped" };
@@ -830,51 +1102,186 @@ function isFinalRefusal(status: number): boolean {
   return status >= 400 && status < 500 && ![401, 408, 429].includes(status);
 }
 
+/** How the coverage check ended: with every relevant entry, or without. */
+export type Coverage = { complete: true; entries: unknown[] } | { complete: false; reason: string };
+
+/** Pages the list can take before the check gives up and says so. */
+export const COVERAGE_MAX_PAGES = 10;
+/** Rows per page — the server's cap, pinned to the migration by test. */
+export const COVERAGE_PAGE_SIZE = 100;
+
+/**
+ * Every entry of yours that could cover any part of [start, end): the list
+ * across ALL projects, paged newest-first with `until` until the page is
+ * short or reaches `since`, plus the running timer, which the list would
+ * not return once it is more than a day old. Anything short of that is
+ * "coverage unknown", never "no coverage": a page the server did not
+ * answer, a 200 whose body is not a list (a login page from something in
+ * front of the API), or a list still full after COVERAGE_MAX_PAGES.
+ */
+export async function fetchCoverage(item: SpoolItem, cfg: Config, tag = ""): Promise<Coverage> {
+  const since = new Date(Date.parse(item.start_time) - 86400 * 1000).toISOString();
+  const entries: unknown[] = [];
+  let until = item.end_time;
+  let previousOldest = Number.POSITIVE_INFINITY;
+  for (let page = 0; page < COVERAGE_MAX_PAGES; page += 1) {
+    const url = `${cfg.apiUrl}/api/v1/entries?limit=${COVERAGE_PAGE_SIZE}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`;
+    let res = await http("GET", url, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+    if (res.status === 429) {
+      // The token's own minute budget, spent by this sweep. One pause, one
+      // retry; a backlog of items must not rate-limit itself into the
+      // double posts this check exists to prevent.
+      await new Promise((r) => setTimeout(r, 1500));
+      res = await http("GET", url, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+    }
+    if (res.status > 0) item.contacted = true;
+    if (res.status !== 200) return { complete: false, reason: `coverage check answered ${res.status || "no network"}` };
+    if (!Array.isArray(res.json)) return { complete: false, reason: "coverage check answered 200 without an entries list" };
+    entries.push(...(res.json as unknown[]));
+    if (res.json.length < COVERAGE_PAGE_SIZE) break;
+    // Full page: the next page starts one millisecond ABOVE the oldest row,
+    // so rows tied at that instant are fetched again rather than skipped —
+    // the server orders by start_time then id, but a page boundary inside a
+    // run of identical start times would otherwise drop the ones that did
+    // not fit. A page that makes no progress (a hundred rows at one
+    // instant) is coverage unknown, never silently short.
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const e of res.json as unknown[]) {
+      if (isRecord(e) && typeof e.start_time === "string") oldest = Math.min(oldest, Date.parse(e.start_time));
+    }
+    if (!Number.isFinite(oldest) || oldest < Date.parse(since)) break;
+    if (oldest >= previousOldest) return { complete: false, reason: "coverage check made no progress: a page of entries sharing one start instant" };
+    previousOldest = oldest;
+    if (page === COVERAGE_MAX_PAGES - 1) return { complete: false, reason: `coverage check still truncated after ${COVERAGE_MAX_PAGES} pages` };
+    until = new Date(oldest + 1).toISOString();
+  }
+  let timer = await http("GET", `${cfg.apiUrl}/api/v1/timer`, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+  if (timer.status === 429) {
+    // Same pause as the list: a complete list must not be thrown away over
+    // the token's own minute budget.
+    await new Promise((r) => setTimeout(r, 1500));
+    timer = await http("GET", `${cfg.apiUrl}/api/v1/timer`, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+  }
+  if (timer.status === 401 || timer.status === 403) {
+    // A knowable, permanent answer (the token lacks timer:read): the list is
+    // still a complete list. Said once, not treated as unknown coverage.
+    logRefusal(`${tag}\ttimer check answered ${timer.status}; the running timer is not visible to this token`);
+  } else if (timer.status !== 200) {
+    return { complete: false, reason: `timer check answered ${timer.status || "no network"}` };
+  } else if (isRecord(timer.json) && typeof timer.json.start_time === "string") {
+    entries.push({ start_time: timer.json.start_time, end_time: null });
+  }
+  return { complete: true, entries };
+}
+
 /**
  * Deliver one spool item. Returns true when the file can be removed:
  * posted, already covered, or refused for good. False keeps it for the next
  * sweep: no credential, no network, a redirect, a 5xx, or a refusal that a
- * token or rate-limit fix would clear.
+ * token or rate-limit fix would clear. Settled stretches are recorded on
+ * `item.done`, which the caller persists when the item is kept.
  */
 export async function deliver(item: SpoolItem, cfg: Config, projectsCache: ProjectsCache = {}): Promise<boolean> {
   if (!cfg.apiKey) return false;
-  const tag = `${item.label}\t${item.repo_key || item.cwd}\t${item.start_time}..${item.end_time}`;
+  const tag = `${item.label}\t${(item.repo_key || item.cwd).replace(/[\r\n\t]+/g, " ")}\t${item.start_time}..${item.end_time}`;
+  const ws = Date.parse(item.start_time);
+  const we = Date.parse(item.end_time);
+  if (!Number.isFinite(ws) || !Number.isFinite(we) || we <= ws) {
+    // Not a window. Nothing the server could accept, and not "covered".
+    logRefusal(`${tag}\tinvalid window (end not after start, or unparseable): discarded`);
+    return true;
+  }
   const resolved = await resolveProject(item, cfg, projectsCache);
   if (resolved.id === null) {
     if (resolved.reason === "lookup-failed") {
-      logRefusal(`${tag}\tprojects lookup failed (${resolved.status || "no network"}), kept for retry`);
+      const why = resolved.status === -2 ? "the server listed no projects at all" : `${resolved.status || "no network"}`;
+      logRefusal(`${tag}\tprojects lookup failed (${why}), kept for retry`);
       return false;
     }
     logRefusal(`${tag}\tunmapped: no map line and no project names this repo`);
     return true;
   }
   const projectId = resolved.id;
-  const since = new Date(Date.parse(item.start_time) - 86400 * 1000).toISOString();
-  const listUrl = `${cfg.apiUrl}/api/v1/entries?project_id=${encodeURIComponent(projectId)}&limit=100&since=${encodeURIComponent(since)}`;
-  const list = await http("GET", listUrl, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
-  if (list.status === 200 && windowCovered(list.json, item.start_time, item.end_time)) {
-    logRefusal(`${tag}\tcovered: stood down, this window was already logged`);
-    return true;
+  // ALL of your projects, not this one: the run that was written down twice
+  // was a hook entry on the child project under the agent's own entries on
+  // the parent, and a per-project check could not see them.
+  const coverage = await fetchCoverage(item, cfg, tag);
+  let segments: Segment[] = [[isoSeconds(ws), isoSeconds(we)]];
+  if (coverage.complete) {
+    segments = uncoveredSegments(coverage.entries, item.start_time, item.end_time);
+    if (segments.length === 0) {
+      const dropped = Math.round(uncoveredMillis(coverage.entries, item.start_time, item.end_time) / 1000);
+      logRefusal(dropped > 0
+        ? `${tag}\tcovered: stood down; ${dropped} s uncovered under the one-minute floor, dropped`
+        : `${tag}\tcovered: stood down, this window was already logged`);
+      return true;
+    }
+    if (!isWhole(segments, ws, we)) {
+      const posted = segments.reduce((n, [a, b]) => n + (Date.parse(b) - Date.parse(a)), 0);
+      logRefusal(`${tag}\tcovered in part: stood down ${Math.round((we - ws - posted) / 60000)} min already logged; posting ${segments.length} uncovered segment(s)`);
+    }
+  } else {
+    logRefusal(`${tag}\t${coverage.reason}; posting without it`);
   }
-  if (list.status !== 200) {
-    logRefusal(`${tag}\tcoverage check answered ${list.status || "no network"}; posting without it`);
+  const done = new Set(item.done ?? []);
+  if (!coverage.complete && done.size > 0) {
+    // Part of this run already landed and this sweep cannot see what. The
+    // whole window is not a stretch that can be posted: it would land over
+    // the part that did, under a different key, and the server's refusal is
+    // same-project only. Kept for a sweep that can ask.
+    logRefusal(`${tag}\tpart of this run already landed and coverage is unknown; kept for a sweep that can ask`);
+    return false;
   }
-  let start = item.start_time;
-  let trimmed = false;
+  let settled = true;
+  for (const [segStart, segEnd] of segments) {
+    if (done.has(`${segStart}|${segEnd}`)) {
+      // Already posted or refused for good on an earlier sweep: that stretch
+      // is not posted twice. Coverage is known here, so whatever landed is
+      // already out of `segments`, and a stretch still here was a final
+      // refusal — skipping it settles it.
+      continue;
+    }
+    const outcome = await postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we);
+    if (outcome === "kept") settled = false;
+    else done.add(`${segStart}|${segEnd}`);
+  }
+  item.done = [...done].sort();
+  return settled;
+}
+
+/** One segment spanning exactly the run's window. */
+function isWhole(segments: readonly Segment[], ws: number, we: number): boolean {
+  const only = segments.length === 1 ? segments[0] : undefined;
+  return only !== undefined && Date.parse(only[0]) === ws && Date.parse(only[1]) === we;
+}
+
+type SegmentOutcome = "posted" | "final" | "kept";
+
+/**
+ * Post one window of a run. A partial window carries meters recomputed from
+ * the run's own marks; an item an older runtime wrote has no marks, and a
+ * partial window of it carries none rather than the whole run's, which would
+ * break the "runtime + wait == active" identity the entry is documented to
+ * satisfy. The whole run keeps the meters it was spooled with, so a runtime
+ * that never re-meters still posts what segmentRuns computed.
+ */
+async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag: string, segStart: string, segEnd: string, ws: number, we: number): Promise<SegmentOutcome> {
+  let start = segStart;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    // A trimmed window no longer matches the meters computed for the whole
-    // run, and a partial meter would break the "runtime + wait == active"
-    // identity the entry is documented to satisfy — so a trimmed entry
-    // carries no meters at all rather than wrong ones.
+    const whole = Date.parse(start) === ws && Date.parse(segEnd) === we;
+    const meters = whole ? { runtimeMin: item.agent_runtime_min, waitMin: item.agent_wait_min } : item.marks ? metersFor(item.marks, start, segEnd) : undefined;
     const body = buildEntryBody({
       project_id: projectId,
       label: item.label,
       start_time: start,
-      end_time: item.end_time,
+      end_time: segEnd,
       session_ref: item.session_ref,
-      idempotency_key: item.idempotency_key,
-      agent_runtime_min: trimmed ? undefined : item.agent_runtime_min,
-      agent_wait_min: trimmed ? undefined : item.agent_wait_min,
+      // A segment is keyed on ITS start instant, like a run: two segments of
+      // one run must not replay each other.
+      idempotency_key: whole ? item.idempotency_key : `${item.session}:${start}`,
+      agent_runtime_min: meters?.runtimeMin,
+      agent_wait_min: meters?.waitMin,
+      prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : undefined,
     });
     const res = await http("POST", `${cfg.apiUrl}/api/v1/entries`, {
       apiKey: cfg.apiKey,
@@ -882,29 +1289,49 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
       session: item.session,
       body,
     });
+    if (res.status > 0) item.contacted = true;
     if (res.status >= 200 && res.status < 300) {
       // A 2xx whose body is not the entry (an HTML page from something in
       // front of the API) is not a success.
-      if (isRecord(res.json)) return true;
-      logRefusal(`${tag}\t${res.status} without an entry body, kept for retry`);
-      return false;
+      if (!isRecord(res.json)) {
+        logRefusal(`${tag}\t${res.status} without an entry body, kept for retry`);
+        return "kept";
+      }
+      // A 2xx whose entry is a DIFFERENT window is the server replaying an
+      // earlier post under the same key — this stretch did not land.
+      const gotStart = typeof res.json.start_time === "string" ? Date.parse(res.json.start_time) : Number.NaN;
+      const gotEnd = typeof res.json.end_time === "string" ? Date.parse(res.json.end_time) : Number.NaN;
+      if (Number.isFinite(gotStart) && Number.isFinite(gotEnd) && (Math.abs(gotStart - Date.parse(start)) > 1000 || Math.abs(gotEnd - Date.parse(segEnd)) > 1000)) {
+        logRefusal(`${tag}\t${res.status} replayed an existing entry with a different window (${res.json.start_time}..${res.json.end_time}); ${start}..${segEnd} kept for retry`);
+        return "kept";
+      }
+      return "posted";
     }
     if (res.status === 409 && attempt === 0) {
       const free = earliestFreeStart(isRecord(res.json) ? res.json.message : undefined);
-      if (free && Date.parse(free) > Date.parse(start) && Date.parse(item.end_time) - Date.parse(free) >= 60000) {
+      if (free && Date.parse(free) > Date.parse(start) && Date.parse(segEnd) - Date.parse(free) >= 60000) {
         start = free;
-        trimmed = true;
         continue;
       }
     }
     if (isFinalRefusal(res.status)) {
+      // A 400 on the FIRST attempt is kept once: "end_time is in the future"
+      // is a clock a few minutes fast, and a field the server does not know
+      // yet is a server behind the client — both clear on their own, and
+      // deleting the run over them lost the hours for good.
+      if (res.status === 400 && (item.tries ?? 0) < 1) {
+        logRefusal(`${tag}\t400 on the first attempt, kept for one retry\t${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
+        return "kept";
+      }
       logRefusal(`${tag}\t${res.status}\t${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
-      return true;
+      return "final";
     }
-    logRefusal(`${tag}\t${res.status || "no network"}\tkept for retry`);
-    return false;
+    // The reason rides along when there is no status to name one: a refused
+    // TLS setup, an aborted request, a socket error.
+    logRefusal(`${tag}\t${res.status || "no network"}\tkept for retry${res.status ? "" : `\t${res.text.replace(/\s+/g, " ").slice(0, 200)}`}`);
+    return "kept";
   }
-  return false;
+  return "kept";
 }
 
 /**
@@ -923,6 +1350,11 @@ function coerceSpoolItem(value: unknown): SpoolItem | null {
   const agent = typeof value.agent === "string" && value.agent ? value.agent : "claude";
   // A meter that is not there is not zero: an item without meters posts none.
   const minutes = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined);
+  // Marks are optional and read leniently: a malformed element is dropped,
+  // and an item with no usable marks is posted on its spooled meters.
+  const marks: Mark[] | undefined = Array.isArray(value.marks)
+    ? value.marks.flatMap((m: unknown) => (isRecord(m) && typeof m.t === "number" && Number.isFinite(m.t) ? [{ t: m.t, k: typeof m.k === "string" ? m.k : "tool" }] : []))
+    : undefined;
   return {
     agent,
     label: typeof value.label === "string" && value.label ? value.label : labelFor(agent),
@@ -935,8 +1367,15 @@ function coerceSpoolItem(value: unknown): SpoolItem | null {
     agent_wait_min: minutes(value.agent_wait_min),
     idempotency_key: typeof value.idempotency_key === "string" && value.idempotency_key ? value.idempotency_key : `${session}:${start}`,
     session_ref: typeof value.session_ref === "string" ? value.session_ref : session,
+    ...(marks ? { marks } : {}),
+    ...(Array.isArray(value.done) ? { done: value.done.filter((d: unknown): d is string => typeof d === "string") } : {}),
+    ...(typeof value.created === "string" ? { created: value.created } : {}),
+    ...(typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {}),
   };
 }
+
+/** Sweeps an item may be kept through before it is pruned regardless of age — an item without a `created` stamp is rewritten on every keep, so age alone would never prune it. */
+export const MAX_TRIES = 20;
 
 /** Sweep the spool, then the leftovers. Runs detached; never prints. */
 export async function cmdFlush(cfg: Config): Promise<void> {
@@ -962,11 +1401,7 @@ export async function cmdFlush(cfg: Config): Promise<void> {
       // Only files are items; a directory that happens to end in .json is
       // not ours to unlink, and would throw on every sweep if we tried.
       if (!stat.isFile()) continue;
-      if (stat.mtimeMs < weekAgo) {
-        logRefusal(`${name}\tpruned: undeliverable for 7 days`);
-        unlinkSync(path);
-        continue;
-      }
+
       // Reading and parsing are separate failures. A read that fails
       // (permissions, a transient I/O error) says nothing about the item, so
       // it is KEPT for the next sweep; only text that is not JSON — which no
@@ -990,11 +1425,59 @@ export async function cmdFlush(cfg: Config): Promise<void> {
       if (!item) {
         // Parsed, but without a window this runtime can post. Another copy of
         // the runtime may understand it; leave it to that copy or to the prune.
-        logRefusal(`${name}\tshape not recognized by runtime ${VERSION}, kept`);
+        if (stat.mtimeMs < weekAgo) {
+          logRefusal(`${name}\tpruned: shape not recognized by any sweep for 7 days`);
+          unlinkSync(path);
+        } else {
+          logRefusal(`${name}\tshape not recognized by runtime ${VERSION}, kept`);
+        }
         continue;
       }
-      if (await deliver(item, cfg, cache)) unlinkSync(path);
+      // Pruned only after it was TRIED and kept for a week — a Friday session
+      // whose flush died with the lid, then a vacation, is delivered on the
+      // first sweep back, not pruned unattempted. The age is the item's own
+      // `created` (an older item without one uses the file's time), because
+      // recording a delivered part rewrites the file.
+      const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
+      const age = Number.isFinite(createdMs) ? createdMs : stat.mtimeMs;
+      // MAX_TRIES is for items with no creation stamp — an older runtime's —
+      // which a rewrite would otherwise keep young forever.
+      if ((age < weekAgo && (item.tries ?? 0) >= 1) || (!item.created && (item.tries ?? 0) >= MAX_TRIES)) {
+        logRefusal(`${name}\tpruned: kept for retry ${item.tries} time(s)${age < weekAgo ? " over 7 days" : ""}`);
+        unlinkSync(path);
+        continue;
+      }
+      const before = JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 });
+      if (await deliver(item, cfg, cache)) {
+        try {
+          unlinkSync(path);
+        } catch (err) {
+          // A concurrent sweep — every SessionStart and every end spawns
+          // one — delivered and removed it first. The idempotency key kept
+          // the data right; only the log needs to tell the truth.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          logRefusal(`${name}\tremoved by a concurrent sweep`);
+        }
+      } else {
+        // A sweep that never reached the server — no credential, no network,
+        // certificate checks off — learned nothing about the item and is not
+        // a try; twenty of those in a morning would otherwise prune a run.
+        if (item.contacted) item.tries = (item.tries ?? 0) + 1;
+        if (JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 }) !== before) {
+          // Part of the run landed, or a try is being counted. Remembered in
+          // place; a failure to rewrite just means the next sweep asks again.
+          try {
+            if (existsSync(path)) writeAtomic(path, JSON.stringify({ ...JSON.parse(text), done: item.done, tries: item.tries }), 0o600);
+          } catch (err) {
+            logRefusal(`${name}\tcould not record the sweep's result: ${errorMessage(err)}`);
+          }
+        }
+      }
     } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        logRefusal(`${name}\tremoved by a concurrent sweep`);
+        continue;
+      }
       // A failure INSIDE delivery (not a parse failure, handled above): keep
       // the file, say why, and let the next sweep try again.
       logRefusal(`${name}\tdelivery threw, kept for retry: ${errorMessage(err)}`);
@@ -1160,7 +1643,9 @@ outcome description, \`agent_label\` naming this agent, \`session_ref\`, and an
 \`end_time\` may never be past the clock; never round \`start_time\` down
 (copy the previous entry's \`end_time\`); on a 409, retry once with the
 earliest free start it names. The hooks record the session as a backstop
-and stand down when your entry already covers the window.
+and stand down for the minutes your entries already cover. Parallel sessions
+APPORTION a person's time; they do not each claim it: if two sessions ran
+side by side, log the person's time once, to one project, or split it.
 `;
 
 function upsertBlock(path: string, block: string, marker: string): boolean {
@@ -1170,7 +1655,23 @@ function upsertBlock(path: string, block: string, marker: string): boolean {
   return true;
 }
 
-export function installCodex(home: string = homedir(), scriptPath: string): string[] {
+/**
+ * The origin `install` writes into a user's global agent config. Never the
+ * environment's: a `SHYRE_API_URL` set for one shell — a devcontainer, a
+ * direnv block trusted once, a colleague's terminal — would otherwise become
+ * a permanent redirect of the bearer token for every future session, with
+ * nothing printed. A non-default origin is written only when asked for on
+ * the command line, and every install prints the origin it wrote.
+ */
+export function installOrigin(argv: readonly string[]): string {
+  const flag = argv.find((a) => a.startsWith("--api-url="));
+  if (!flag) return DEFAULT_API_URL;
+  const url = validApiUrl(flag.slice("--api-url=".length));
+  if (!url) throw new Error(`--api-url must be an https origin with no path (got ${JSON.stringify(flag.slice("--api-url=".length))})`);
+  return url;
+}
+
+export function installCodex(home: string = homedir(), scriptPath: string, apiUrl: string = DEFAULT_API_URL): string[] {
   const dir = ensureDir(join(home, ".codex"));
   const hooksPath = join(dir, "hooks.json");
   const merged = mergeHooks(readUserJson(hooksPath), claudeShapedHooks("codex", scriptPath, { SessionEnd: 3 }));
@@ -1181,7 +1682,7 @@ export function installCodex(home: string = homedir(), scriptPath: string): stri
   if (!/^\[mcp_servers\.shyre\]/m.test(toml)) {
     // `apiUrl` is validated to the URL character set, so it is safe inside a
     // TOML basic string.
-    const block = `\n[mcp_servers.shyre]\nurl = "${readConfig().apiUrl}/api/mcp"\nbearer_token_env_var = "SHYRE_API_KEY"\n`;
+    const block = `\n[mcp_servers.shyre]\nurl = "${apiUrl}/api/mcp"\nbearer_token_env_var = "SHYRE_API_KEY"\n`;
     writeUserFile(tomlPath, `${toml.trimEnd()}\n${block}`);
     changed.push(tomlPath);
   }
@@ -1211,7 +1712,7 @@ function postInstallNotes(agent: string | undefined): readonly string[] {
   return [];
 }
 
-export function installCursor(home: string = homedir(), scriptPath: string): string[] {
+export function installCursor(home: string = homedir(), scriptPath: string, apiUrl: string = DEFAULT_API_URL): string[] {
   const dir = ensureDir(join(home, ".cursor"));
   const hooksPath = join(dir, "hooks.json");
   const mcpPath = join(dir, "mcp.json");
@@ -1226,7 +1727,7 @@ export function installCursor(home: string = homedir(), scriptPath: string): str
   const changed = [hooksPath];
   if (!servers.shyre) {
     servers.shyre = {
-      url: `${readConfig().apiUrl}/api/mcp`,
+      url: `${apiUrl}/api/mcp`,
       headers: { Authorization: "Bearer ${SHYRE_API_KEY}" },
     };
     writeUserFile(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
@@ -1235,45 +1736,200 @@ export function installCursor(home: string = homedir(), scriptPath: string): str
   const rules = ensureDir(join(dir, "rules"));
   const rulePath = join(rules, "shyre.mdc");
   if (!existsSync(rulePath)) {
-    writeAtomic(rulePath, `---\ndescription: Log your own time to Shyre\nalwaysApply: true\n---\n\n${CONVENTION}`);
+    writeAtomic(rulePath, `---\ndescription: Log your own time to Shyre\nalwaysApply: true\n---\n\n${CONVENTION}`, 0o644);
     changed.push(rulePath);
   }
   return changed;
 }
 
-export function cmdInstall(agent: string | undefined): string[] {
+/** Our hook entries removed from a hooks file; the user's own kept. */
+function withoutOurHooks(existing: Record<string, unknown>): { file: Record<string, unknown>; changed: boolean } {
+  const out: Record<string, unknown> = { ...existing };
+  const prevHooks = isRecord(out.hooks) ? { ...out.hooks } : {};
+  let changed = false;
+  for (const [event, entries] of Object.entries(prevHooks)) {
+    if (!Array.isArray(entries)) continue;
+    const kept = entries.filter((e: unknown) => !isOurEntry(e));
+    if (kept.length !== entries.length) changed = true;
+    if (kept.length === 0) delete prevHooks[event];
+    else prevHooks[event] = kept;
+  }
+  out.hooks = prevHooks;
+  return { file: out, changed };
+}
+
+/** The convention block removed from a Markdown file, from its marker to the next heading of the same level or the end. */
+function withoutBlock(text: string, marker: string): string | null {
+  const at = text.indexOf(marker);
+  if (at < 0) return null;
+  const rest = text.slice(at + marker.length);
+  const next = rest.search(/\n## /);
+  const after = next < 0 ? "" : rest.slice(next + 1);
+  return `${text.slice(0, at).trimEnd()}${after ? `\n\n${after}` : "\n"}`;
+}
+
+export function uninstallCodex(home: string = homedir()): string[] {
+  const dir = join(home, ".codex");
+  const changed: string[] = [];
+  const hooksPath = join(dir, "hooks.json");
+  if (existsSync(hooksPath)) {
+    const { file, changed: did } = withoutOurHooks(readUserJson(hooksPath));
+    if (did) {
+      writeUserFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`);
+      changed.push(hooksPath);
+    }
+  }
+  const tomlPath = join(dir, "config.toml");
+  if (existsSync(tomlPath)) {
+    const toml = readFileSync(tomlPath, "utf8");
+    // Our block: from its header to the next table header or the end.
+    const stripped = toml.replace(/\n?\[mcp_servers\.shyre\][^[]*/m, "\n");
+    if (stripped !== toml) {
+      writeUserFile(tomlPath, `${stripped.trimEnd()}\n`);
+      changed.push(tomlPath);
+    }
+  }
+  const agentsPath = join(dir, "AGENTS.md");
+  if (existsSync(agentsPath)) {
+    const without = withoutBlock(readFileSync(agentsPath, "utf8"), "## Shyre — log your own time");
+    if (without !== null) {
+      writeUserFile(agentsPath, without, 0o644);
+      changed.push(agentsPath);
+    }
+  }
+  return changed;
+}
+
+export function uninstallCursor(home: string = homedir()): string[] {
+  const dir = join(home, ".cursor");
+  const changed: string[] = [];
+  const hooksPath = join(dir, "hooks.json");
+  if (existsSync(hooksPath)) {
+    const { file, changed: did } = withoutOurHooks(readUserJson(hooksPath));
+    if (did) {
+      writeUserFile(hooksPath, `${JSON.stringify(file, null, 2)}\n`);
+      changed.push(hooksPath);
+    }
+  }
+  const mcpPath = join(dir, "mcp.json");
+  if (existsSync(mcpPath)) {
+    const mcp = readUserJson(mcpPath);
+    const servers = isRecord(mcp.mcpServers) ? { ...mcp.mcpServers } : null;
+    if (servers && servers.shyre !== undefined) {
+      delete servers.shyre;
+      mcp.mcpServers = servers;
+      writeUserFile(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
+      changed.push(mcpPath);
+    }
+  }
+  const rulePath = join(dir, "rules", "shyre.mdc");
+  if (existsSync(rulePath)) {
+    unlinkSync(rulePath);
+    changed.push(rulePath);
+  }
+  return changed;
+}
+
+export interface InstallOptions {
+  apiUrl: string;
+  uninstall: boolean;
+}
+
+export function cmdInstall(agent: string | undefined, opts: InstallOptions = { apiUrl: DEFAULT_API_URL, uninstall: false }): string[] {
+  if (opts.uninstall) {
+    if (agent === "codex") return uninstallCodex(homedir());
+    if (agent === "cursor") return uninstallCursor(homedir());
+    if (agent === "claude") throw new Error("Claude Code uninstalls through the plugin: claude plugin uninstall shyre");
+    throw new Error(`no uninstaller for "${agent ?? ""}" (supported: codex, cursor)`);
+  }
   const scriptPath = installRuntimeCopy();
-  if (agent === "codex") return installCodex(homedir(), scriptPath);
-  if (agent === "cursor") return installCursor(homedir(), scriptPath);
+  if (agent === "codex") return installCodex(homedir(), scriptPath, opts.apiUrl);
+  if (agent === "cursor") return installCursor(homedir(), scriptPath, opts.apiUrl);
   if (agent === "claude") {
     throw new Error("Claude Code installs through the plugin: claude plugin install shyre@theshyre");
   }
   throw new Error(`no installer for "${agent ?? ""}" yet (supported: codex, cursor; Claude Code uses the plugin)`);
 }
 
-function cmdDoctor(): void {
-  const cfg = readConfig();
-  const configPath = join(shyreHome(), "config.json");
-  let configNote = "none";
-  if (existsSync(configPath)) {
-    const mode = statSync(configPath).mode & 0o777;
-    configNote = mode & 0o077 ? `present — WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600";
+/** The doctor's lines; each computed on its own, so one failure does not hide the rest. */
+export async function doctorLines(cfg: Config, cwd: string = process.cwd(), probe: boolean = cfg.apiUrl === DEFAULT_API_URL): Promise<string[]> {
+  const lines: string[] = [`shyre-hook ${VERSION}`, `home: ${shyreHome()}`];
+  const attempt = (label: string, fn: () => string): void => {
+    try {
+      lines.push(fn());
+    } catch (err) {
+      lines.push(`${label}: could not be read (${errorMessage(err)})`);
+    }
+  };
+  attempt("api", () => `api: ${cfg.apiUrl}${cfg.apiUrl === DEFAULT_API_URL ? "" : `   WARNING: not the default ${DEFAULT_API_URL} — set by SHYRE_API_URL or ~/.shyre/config.json; the token is sent here`}`);
+  // Only the prefix and four characters: doctor output ends up in issues.
+  attempt("token", () => `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}…)` : "MISSING — export SHYRE_API_KEY or write ~/.shyre/config.json"}`);
+  attempt("config file", () => {
+    const configPath = join(shyreHome(), "config.json");
+    const mode = modeOf(configPath);
+    if (mode === undefined) return "config file: none";
+    return `config file: ${mode & 0o077 ? `present — WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600"}`;
+  });
+  attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
+  attempt("tls", () => (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 — the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on"));
+  // The repository the current directory is in, and whether anything names it.
+  const remote = gitRemote(cwd);
+  const repoKey = repoKeyFromRemote(remote);
+  const mapFile = readMapFileFrom();
+  attempt("repo", () => `repo: ${cwd} → ${remote ?? "no git remote"} → ${repoKey ?? "no repo key"}`);
+  attempt("map", () => {
+    if (!mapFile) return "map: none (server github_repo fallback only)";
+    const hit = repoKey ? resolveFromMap(mapFile.map, repoKey) : null;
+    const dflt = isRecord(mapFile.map) && typeof mapFile.map._default === "string" ? ` (a _default routes unmapped repos to ${mapFile.map._default})` : "";
+    return `map: ${mapFile.path}${dflt} → ${hit ? `this repo → ${hit}` : "this repo is not in it"}`;
+  });
+  // One request: the token's validity and whether a project names this repo.
+  // Not to a non-default origin unless asked — doctor is what a person runs
+  // when the origin is wrong, and it must not hand the token to it.
+  if (cfg.apiKey && !probe) {
+    lines.push(`server: not asked — the origin is not the default; run doctor --probe to send the token to ${cfg.apiUrl}`);
+  } else if (cfg.apiKey) {
+    try {
+      const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: "claude", session: "doctor" });
+      const rows = res.status === 200 ? toProjectRows(res.json) : null;
+      if (rows) {
+        const hit = repoKey ? rows.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === repoKey) : undefined;
+        lines.push(`server: ${res.status}, ${rows.length} project(s)${repoKey ? `; ${hit ? `github_repo names this repo → ${hit.id}` : "NO project's github_repo names this repo — sessions here will be kept, then pruned"}` : ""}`);
+      } else {
+        lines.push(`server: ${res.status === 401 ? "401 — the token is refused (revoked, expired, offboarded, or the team's integrations are off); re-mint it" : `${res.status || "no network"} — ${res.text.replace(/\s+/g, " ").slice(0, 120)}`}`);
+      }
+    } catch (err) {
+      lines.push(`server: could not be asked (${errorMessage(err)})`);
+    }
+  } else {
+    lines.push("server: not asked (no token)");
   }
-  const spoolItems = readdirSync(spoolDir()).filter((n) => n.endsWith(".json"));
-  const oldest = spoolItems.reduce((acc, n) => Math.min(acc, statSync(join(spoolDir(), n)).mtimeMs), Date.now());
-  const lines = [
-    `shyre-hook ${VERSION}`,
-    `home: ${shyreHome()}`,
-    `api: ${cfg.apiUrl}`,
-    // Only the prefix and four characters: doctor output ends up in issues.
-    `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}…)` : "MISSING — export SHYRE_API_KEY or write ~/.shyre/config.json"}`,
-    `config file: ${configNote}`,
-    `idle cap: ${cfg.idleCapSeconds}s`,
-    `map: ${readMapFile() ? "found" : "none (server github_repo fallback only)"}`,
-    `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest ${Math.round((Date.now() - oldest) / 3600000)} h; pruned after 7 days)` : ""}`,
-    `sessions: ${readdirSync(sessionsDir()).filter((n) => n.endsWith(".meta.json")).length} open`,
-    `tmpdir (legacy shell kit state, not used): ${tmpdir()}`,
-  ];
+  attempt("spool", () => {
+    const dir = spoolDir();
+    const spoolItems = readdirSync(dir).filter((n) => n.endsWith(".json"));
+    const oldest = spoolItems.reduce((acc, n) => Math.min(acc, statSync(join(dir, n)).mtimeMs), Date.now());
+    return `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest ${Math.round((Date.now() - oldest) / 3600000)} h; pruned after 7 days once tried)` : ""}`;
+  });
+  attempt("sessions", () => {
+    const dir = sessionsDir();
+    const names = readdirSync(dir);
+    const open = names.filter((n) => n.endsWith(".meta.json")).length;
+    const newest = names.filter((n) => n.endsWith(".marks")).reduce((acc, n) => Math.max(acc, statSync(join(dir, n)).mtimeMs), 0);
+    return `sessions: ${open} open; last mark recorded: ${newest ? new Date(newest).toISOString() : "never (no session has written a mark; if an agent is running, its hook is not firing or its payload is not read — see refusals)"}`;
+  });
+  attempt("refusals", () => {
+    const path = refusalLogPath();
+    if (!existsSync(path)) return `refusals: none logged (${path})`;
+    const all = readFileSync(path, "utf8").split("\n").filter((l) => l.trim() !== "");
+    const last = (all[all.length - 1] ?? "").replace(/shyre_pat_[A-Za-z0-9_-]+/g, "shyre_pat_[REDACTED]");
+    return `refusals: ${all.length} line(s) in ${path}; last: ${last.slice(0, 200)}`;
+  });
+  return lines;
+}
+
+async function cmdDoctor(argv: readonly string[] = []): Promise<void> {
+  const cfg = readConfig();
+  const lines = await doctorLines(cfg, process.cwd(), cfg.apiUrl === DEFAULT_API_URL || argv.includes("--probe"));
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
@@ -1285,15 +1941,18 @@ function cmdDoctor(): void {
 const INTERACTIVE = new Set(["install", "doctor"]);
 
 export async function main(argv: readonly string[]): Promise<void> {
-  const [first, second, third] = argv;
+  const positional = argv.filter((a) => !a.startsWith("--"));
+  const [first, second, third] = positional;
   const cfg = readConfig();
   if (first === "flush") return cmdFlush(cfg);
-  if (first === "doctor") return cmdDoctor();
+  if (first === "doctor") return cmdDoctor(argv);
   if (first === "install") {
-    const changed = cmdInstall(second);
-    const notes = postInstallNotes(second);
+    const uninstall = argv.includes("--uninstall");
+    const apiUrl = installOrigin(argv);
+    const changed = cmdInstall(second, { apiUrl, uninstall });
+    const notes = uninstall ? [] : postInstallNotes(second);
     process.stdout.write(
-      `shyre: configured ${second ?? ""}\n${changed.map((p) => `  ${p}`).join("\n")}\n` +
+      `shyre: ${uninstall ? "removed from" : "configured"} ${second ?? ""}${uninstall ? "" : ` — API origin ${apiUrl}`}\n${changed.length ? changed.map((p) => `  ${p}`).join("\n") : "  (nothing to change)"}\n` +
         (notes.length ? `\nNext:\n${notes.map((n) => `  - ${n}`).join("\n")}\n` : ""),
     );
     return;

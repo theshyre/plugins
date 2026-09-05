@@ -1,0 +1,5 @@
+# The runtime is authored in shyre-hook.ts; the .mjs beside it is esbuild
+# output. Marked generated so GitHub's language statistics and diffs treat it
+# as the build it is, not as hand-written JavaScript.
+plugins/shyre/hooks/shyre-hook.mjs linguist-generated=true
+plugins/shyre/hooks/shyre-hook.mjs.sha256 linguist-generated=true

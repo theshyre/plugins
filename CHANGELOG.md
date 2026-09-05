@@ -4,6 +4,82 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.1.0 — 2026-09-05
+- The API origin is `https://shyre.io`, the canonical address since
+  2026-09-04. The legacy host keeps answering `/api/**` and `/hooks/**`
+  unredirected, so a 1.0.2 install keeps landing time.
+- `install` never writes the environment's origin into a user's global agent
+  config: a `SHYRE_API_URL` set for one shell used to become a permanent
+  redirect of the bearer token for every future Codex or Cursor session,
+  with nothing printed. A non-default origin is written only with
+  `--api-url=<origin>` on the command line, and every install prints the
+  origin it wrote. `doctor` warns when the running origin is not the default.
+- `install --uninstall <agent>` removes exactly what install added — the hook
+  entries, the MCP server, the convention block — and keeps the user's own.
+- A rewritten user file keeps its mode, and so does its `.bak`; a 600
+  `config.toml` or `mcp.json` no longer comes back 644 with a 644 copy beside
+  it. New files the runtime writes into `~/.codex` and `~/.cursor` are 600.
+- A payload the runtime cannot read — no session id, not JSON, larger than
+  four megabytes — is said in the log once a minute instead of never, and
+  `doctor` shows when the last mark was recorded, so a silent install is
+  visible before someone notices a missing week.
+- `doctor` answers the four questions a broken setup asks: it resolves the
+  current directory's repository and repo key, says which map file (if any)
+  names it, makes one request to the server to tell a refused token from a
+  repo no project names — but not to a non-default origin unless
+  `doctor --probe` asks it to — and shows the refusals log's line count and
+  last line with any token-shaped text redacted. It prints what it can when
+  the home is unwritable.
+- A 400 on the first attempt is kept for one retry rather than settled: a
+  clock a few minutes fast ("end_time is in the future") and a server behind
+  the client (a field it does not know yet) both clear on their own, and the
+  run was being deleted over them.
+- The seven-day prune applies only to items a sweep that reached the server
+  has kept, by the item's own creation time; a sweep with no credential, no
+  network or certificate checks off learns nothing and is not a try. A
+  session whose flush died with the laptop lid, then a vacation, is delivered
+  on the first sweep back, not pruned unattempted. An item with no creation
+  stamp (an older runtime's) is capped at twenty tries instead.
+- A 429 on the timer read is retried once like the list, so a complete
+  coverage list is not thrown away over the token's own minute budget; an
+  empty projects list is a failed lookup (kept), not the fact that nothing
+  names this repo (settled); a running timer covers a day at most, the
+  server's own per-entry maximum; the log says how many seconds under the
+  one-minute floor were dropped when a run is stood down.
+- `SHYRE_HOOK_LOG` must resolve under the Shyre home, and no field a
+  repository controls can put a line break in the log. The detached flush
+  cannot crash a hook on a spawn error. The token is not sent to an https
+  origin while `NODE_TLS_REJECT_UNAUTHORIZED=0` disables certificate checks.
+  `SHYRE_IDLE_CAP_SECONDS` is capped at a day. `origin` is tried first and
+  `upstream` second for the repository's remote, for fork-based teams.
+
+- The stand-down is by the minute, across all of your projects. Before
+  posting, the runtime lists your entries on every project — paging with
+  `until` until it has every entry that starts before the run ends, plus the
+  running timer — and posts only the parts of a run no entry already covers,
+  with both meters recomputed for each part from the run's own marks. A
+  page it cannot fetch, a body that is not a list, or a list still full
+  after ten pages is "coverage unknown": the run is posted and the log says
+  so. It used to ask one project, one page, and stand the whole run down on
+  any overlap, which let a session on a child project be written down twice
+  under the parent's entries, and let a short entry inside a long session
+  drop the rest of the run. Needs Shyre from 2026-09-04 (the list's `until`).
+- A partly delivered run remembers which stretches landed (`done` on the
+  spool item) and never posts one twice; a 2xx whose entry is a different
+  window than the one posted is treated as the server replaying an earlier
+  post, and the stretch is kept for the next sweep.
+- A tenth field, `prompt_marks`: the instants you sent a prompt inside the
+  run, to the second, at most 2,000 and sampled evenly across the window when
+  there are more. Timestamps only, no prompt text. Shyre uses them to suggest
+  how an overlap between two sessions splits. A server older than 2026-09-04
+  refuses the field; update Shyre first.
+- The log-your-time skill and the installed convention gain the rule for
+  parallel sessions: they apportion a person's time, they do not each claim
+  it.
+- Spool items now carry the run's marks locally, so a partly covered run can
+  be re-metered. Items written by an older runtime are posted on what they
+  have; a partial window of one carries no meters rather than wrong ones.
+
 ## 1.0.2 — 2026-09-03
 
 - The runtime is now authored in TypeScript (`hooks/shyre-hook.ts`, shipped
