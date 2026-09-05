@@ -36,7 +36,11 @@ node ~/.shyre/bin/shyre-hook.mjs install codex
 node ~/.shyre/bin/shyre-hook.mjs install cursor
 ```
 
-`node shyre-hook.mjs doctor` prints what the runtime can see. The full guide
+`node shyre-hook.mjs doctor` prints what the runtime can see. `node
+shyre-hook.mjs backfill --since=YYYY-MM-DD --dry-run` reconstructs runs from
+this machine's Claude Code transcripts for sessions before the plugin was
+installed (timestamps only; drop `--dry-run` to log them, marked backfilled).
+The full guide
 is at https://shyre.io/docs/guides/features/agent-hooks-kit (Shyre
 account required). To verify a downloaded runtime, compare its SHA-256 with the
 file at the matching `v<version>` tag in this repository — a second origin. The

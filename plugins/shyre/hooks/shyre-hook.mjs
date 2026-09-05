@@ -110,7 +110,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.2.0";
+var VERSION = "1.3.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -281,13 +281,14 @@ function buildEntryBody(item) {
     project_id: item.project_id,
     start_time: item.start_time,
     end_time: item.end_time,
-    description: `${item.label} session \u2014 active time (idle gaps excluded); see transcript`,
+    description: item.backfilled ? `${item.label} session \u2014 backfilled from local history after the fact; active time (idle gaps excluded)` : `${item.label} session \u2014 active time (idle gaps excluded); see transcript`,
     agent_label: item.label,
     session_ref: item.session_ref,
     idempotency_key: item.idempotency_key,
     agent_runtime_min: item.agent_runtime_min,
     agent_wait_min: item.agent_wait_min,
-    prompt_marks: item.prompt_marks
+    prompt_marks: item.prompt_marks,
+    backfilled: item.backfilled === true
   };
 }
 function uncoveredSegments(entries, start, end, nowIso2 = (/* @__PURE__ */ new Date()).toISOString()) {
@@ -474,12 +475,12 @@ function gitRemote(cwd, env = process.env) {
   for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete clean[k];
   for (const name of ["origin", "upstream"]) {
     try {
-      const url = execFileSync("git", ["-C", cwd, "remote", "get-url", name], {
+      const url = execFileSync("git", ["-c", "core.fsmonitor=", "-C", cwd, "remote", "get-url", name], {
         encoding: "utf8",
         timeout: 3e3,
         stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
-        env: clean
+        env: { ...clean, GIT_TERMINAL_PROMPT: "0" }
       }).trim();
       if (url) return url;
     } catch {
@@ -794,6 +795,10 @@ async function deliver(item, cfg, projectsCache = {}) {
       logRefusal(`${tag}	covered in part: stood down ${Math.round((we - ws - posted) / 6e4)} min already logged; posting ${segments.length} uncovered segment(s)`);
     }
   } else {
+    if (item.backfilled) {
+      logRefusal(`${tag}	${coverage.reason}; a backfilled run is kept for retry, never posted blind`);
+      return false;
+    }
     logRefusal(`${tag}	${coverage.reason}; posting without it`);
   }
   const done = new Set(item.done ?? []);
@@ -833,7 +838,8 @@ async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we) 
       idempotency_key: whole ? item.idempotency_key : `${item.session}:${start}`,
       agent_runtime_min: meters?.runtimeMin,
       agent_wait_min: meters?.waitMin,
-      prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : void 0
+      prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : void 0,
+      backfilled: item.backfilled === true
     });
     const res = await http("POST", `${cfg.apiUrl}/api/v1/entries`, {
       apiKey: cfg.apiKey,
@@ -900,7 +906,8 @@ function coerceSpoolItem(value) {
     ...Array.isArray(value.done) ? { done: value.done.filter((d) => typeof d === "string") } : {},
     ...typeof value.created === "string" ? { created: value.created } : {},
     ...typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {},
-    ...typeof value.drop_attempts === "number" && Number.isFinite(value.drop_attempts) && value.drop_attempts >= 0 ? { drop_attempts: value.drop_attempts } : {}
+    ...typeof value.drop_attempts === "number" && Number.isFinite(value.drop_attempts) && value.drop_attempts >= 0 ? { drop_attempts: value.drop_attempts } : {},
+    ...value.backfilled === true ? { backfilled: true } : {}
   };
 }
 var MAX_TRIES = 20;
@@ -1406,13 +1413,205 @@ async function cmdDoctor(argv = []) {
   process.stdout.write(`${lines.join("\n")}
 `);
 }
-var INTERACTIVE = /* @__PURE__ */ new Set(["install", "doctor"]);
+var TRANSCRIPT_FIELDS = ["type", "timestamp", "cwd", "sessionId", "isMeta", "toolUseResult"];
+function pickTranscriptEvent(line) {
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const type = typeof parsed[TRANSCRIPT_FIELDS[0]] === "string" ? parsed[TRANSCRIPT_FIELDS[0]] : "";
+  if (type !== "user" && type !== "assistant") return null;
+  if (parsed[TRANSCRIPT_FIELDS[4]] === true) return null;
+  const ts = typeof parsed[TRANSCRIPT_FIELDS[1]] === "string" ? Date.parse(parsed[TRANSCRIPT_FIELDS[1]]) : Number.NaN;
+  if (!Number.isFinite(ts)) return null;
+  const cwd = typeof parsed[TRANSCRIPT_FIELDS[2]] === "string" ? parsed[TRANSCRIPT_FIELDS[2]] : null;
+  const sid = typeof parsed[TRANSCRIPT_FIELDS[3]] === "string" ? parsed[TRANSCRIPT_FIELDS[3]] : null;
+  const toolResult = parsed[TRANSCRIPT_FIELDS[5]] !== void 0;
+  return { type, t: ts, cwd, sessionId: sid, toolResult };
+}
+function marksFromTranscriptEvents(events) {
+  const sorted = [...events].sort((a, b) => a.t - b.t);
+  const marks = sorted.map((e) => ({ t: e.t, k: e.type === "user" && !e.toolResult ? "prompt" : "tool" }));
+  for (let i = 1; i < marks.length; i++) {
+    const cur = marks[i];
+    const prev = marks[i - 1];
+    if (cur && prev && cur.k === "prompt" && prev.k === "tool") prev.k = "stop";
+  }
+  return marks;
+}
+function optionValue(argv, name) {
+  const hit = argv.find((a) => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : null;
+}
+function backfillOptions(argv, env = process.env, now = Date.now()) {
+  const since = optionValue(argv, "since");
+  const until = optionValue(argv, "until");
+  const sinceMs = since ? Date.parse(since) : now - 30 * 86400 * 1e3;
+  const untilMs = until ? Date.parse(until) : now;
+  if (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs) || sinceMs >= untilMs) {
+    throw new Error("backfill: --since and --until must be dates (YYYY-MM-DD), since before until");
+  }
+  const explicit = optionValue(argv, "transcripts");
+  const configDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.trim() ? env.CLAUDE_CONFIG_DIR : join(homedir(), ".claude");
+  return { sinceMs, untilMs, dryRun: argv.includes("--dry-run"), transcriptsDir: explicit ?? join(configDir, "projects") };
+}
+function readTranscriptSessions(dir, sinceMs, untilMs) {
+  const sessions = /* @__PURE__ */ new Map();
+  let projects = [];
+  try {
+    projects = readdirSync(dir).sort();
+  } catch {
+    return [];
+  }
+  for (const project of projects) {
+    const projectDir = join(dir, project);
+    let files = [];
+    try {
+      files = readdirSync(projectDir).filter((f) => f.endsWith(".jsonl")).sort();
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const path = join(projectDir, file);
+      try {
+        if (statSync(path).mtimeMs < sinceMs) continue;
+      } catch {
+        continue;
+      }
+      let text;
+      try {
+        text = readFileSync(path, "utf8");
+      } catch (err) {
+        logRefusal(`backfill	${path}	could not be read, skipped: ${errorMessage(err)}`);
+        continue;
+      }
+      const fallbackId = file.replace(/\.jsonl$/, "");
+      for (const line of text.split("\n")) {
+        if (!line) continue;
+        const ev = pickTranscriptEvent(line);
+        if (!ev) continue;
+        if (ev.t < sinceMs || ev.t >= untilMs) continue;
+        const id = ev.sessionId ?? fallbackId;
+        let session = sessions.get(id);
+        if (!session) {
+          session = { sessionId: id, cwd: null, events: [] };
+          sessions.set(id, session);
+        }
+        if (session.cwd === null && ev.cwd) session.cwd = ev.cwd;
+        session.events.push(ev);
+      }
+    }
+  }
+  return [...sessions.values()];
+}
+function hooksSessionMoving(sessionId, nowMs, idleCapMs) {
+  try {
+    const marks = `${stateBase("claude", sessionId)}.marks`;
+    if (!existsSync(marks)) return false;
+    return nowMs - statSync(marks).mtimeMs < idleCapMs;
+  } catch {
+    return false;
+  }
+}
+function planBackfill(sessions, idleCapSeconds, createdIso = nowIso(), nowMs = Date.now(), liveSession = hooksSessionMoving) {
+  const runs = [];
+  const skipped = [];
+  const idleCapMs = idleCapSeconds * 1e3;
+  let unmapped = 0;
+  for (const session of sessions) {
+    if (session.events.length === 0) continue;
+    const newest = session.events.reduce((m, e) => e.t > m ? e.t : m, 0);
+    if (nowMs - newest < idleCapMs || liveSession(session.sessionId, nowMs, idleCapMs)) {
+      skipped.push(session.sessionId);
+      continue;
+    }
+    const marks = marksFromTranscriptEvents(session.events);
+    const cwd = session.cwd ?? "";
+    let repoKey = null;
+    if (cwd) {
+      try {
+        repoKey = existsSync(cwd) ? repoKeyFromRemote(gitRemote(cwd)) : null;
+      } catch {
+        repoKey = null;
+      }
+    }
+    const segmented = segmentRuns(marks, idleCapSeconds);
+    if (segmented.length > 0 && (repoKey === null || !REPO_KEY_SHAPE.test(repoKey))) unmapped += 1;
+    for (const run of segmented) {
+      runs.push({
+        agent: "claude",
+        label: AGENT_LABELS.claude,
+        session: session.sessionId,
+        cwd,
+        repo_key: repoKey,
+        start_time: run.start,
+        end_time: run.end,
+        agent_runtime_min: run.runtimeMin,
+        agent_wait_min: run.waitMin,
+        marks: run.marks,
+        // Its own namespace: a live run of the same session keyed on the
+        // same start instant is the same minutes, and the coverage check at
+        // delivery settles that; the key must not replay the live entry.
+        idempotency_key: `backfill:${session.sessionId}:${run.start}`,
+        session_ref: session.sessionId,
+        created: createdIso,
+        backfilled: true
+      });
+    }
+  }
+  return { sessions: sessions.length, runs, unmapped, skipped };
+}
+function formatBackfillPlan(plan, opts) {
+  const minutes = plan.runs.reduce((sum, r) => sum + Math.round((Date.parse(r.end_time) - Date.parse(r.start_time)) / 6e4), 0);
+  const lines = [
+    `backfill: ${new Date(opts.sinceMs).toISOString().slice(0, 10)} \u2192 ${new Date(opts.untilMs).toISOString().slice(0, 10)}${opts.dryRun ? " (dry run \u2014 nothing written)" : ""}`,
+    `  sessions with activity: ${plan.sessions}`,
+    `  runs found: ${plan.runs.length} (${minutes} min of active time, idle gaps excluded)`,
+    `  runs on a directory no project names: ${plan.unmapped} session(s) \u2014 they will be refused as unmapped and written to the refusals log`,
+    `  skipped as still moving: ${plan.skipped.length} session(s) \u2014 inside the idle cap, or the hooks are writing marks for them; run backfill again after they end`
+  ];
+  for (const r of plan.runs.slice(0, 200)) {
+    const shown = r.repo_key && REPO_KEY_SHAPE.test(r.repo_key) ? r.repo_key : r.repo_key ? "(local)" : "(unmapped)";
+    lines.push(`  ${r.start_time}  ${r.end_time}  ${String(r.agent_runtime_min ?? 0).padStart(4)}m working ${String(r.agent_wait_min ?? 0).padStart(4)}m waiting  ${shown}`);
+  }
+  if (plan.runs.length > 200) lines.push(`  \u2026 and ${plan.runs.length - 200} more`);
+  return lines.join("\n");
+}
+async function cmdBackfill(argv, cfg) {
+  const opts = backfillOptions(argv);
+  const sessions = readTranscriptSessions(opts.transcriptsDir, opts.sinceMs, opts.untilMs);
+  const plan = planBackfill(sessions, cfg.idleCapSeconds);
+  process.stdout.write(`${formatBackfillPlan(plan, opts)}
+`);
+  if (opts.dryRun) return;
+  for (const id of plan.skipped) logRefusal(`backfill	${id}	skipped: still moving inside the idle cap; run backfill again after it ends`);
+  if (plan.runs.length === 0) return;
+  const dir = spoolDir();
+  let spooled = 0;
+  for (const item of plan.runs) {
+    const safe = String(item.session).replace(/[^A-Za-z0-9._-]/g, "_");
+    try {
+      writeAtomic(join(dir, `claude-backfill-${safe}-${item.start_time.replace(/[^0-9TZ]/g, "")}.json`), JSON.stringify(item), 384);
+      spooled += 1;
+    } catch (err) {
+      logRefusal(`backfill	${item.session}	${item.start_time}	could not be spooled: ${errorMessage(err)}`);
+    }
+  }
+  process.stdout.write(`  spooled ${spooled} run(s); delivering now \u2014 a window an entry already covers is skipped, and anything refused is in the refusals log.
+`);
+  await cmdFlush(cfg);
+}
+var INTERACTIVE = /* @__PURE__ */ new Set(["install", "doctor", "backfill"]);
 async function main(argv) {
   const positional = argv.filter((a) => !a.startsWith("--"));
   const [first, second, third] = positional;
   const cfg = readConfig();
   if (first === "flush") return cmdFlush(cfg);
   if (first === "doctor") return cmdDoctor(argv);
+  if (first === "backfill") return cmdBackfill(argv, cfg);
   if (first === "install") {
     const uninstall = argv.includes("--uninstall");
     const apiUrl = installOrigin(argv);
@@ -1474,8 +1673,10 @@ export {
   PRUNE_AFTER_DAYS,
   STDIN_MAX_BYTES,
   VERSION,
+  backfillOptions,
   buildEntryBody,
   claudeShapedHooks,
+  cmdBackfill,
   cmdBeat,
   cmdEnd,
   cmdFlush,
@@ -1487,7 +1688,9 @@ export {
   doctorLines,
   earliestFreeStart,
   fetchCoverage,
+  formatBackfillPlan,
   gitRemote,
+  hooksSessionMoving,
   installCodex,
   installCursor,
   installOrigin,
@@ -1495,12 +1698,16 @@ export {
   logRefusal,
   main,
   mapFileCandidates,
+  marksFromTranscriptEvents,
   metersFor,
   nodeCommand,
   normalizePayload,
   parseMarks,
+  pickTranscriptEvent,
+  planBackfill,
   promptMarksFor,
   readConfig,
+  readTranscriptSessions,
   refusalLogPath,
   repoKeyFromRemote,
   resolveFromMap,

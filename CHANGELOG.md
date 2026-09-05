@@ -4,6 +4,20 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.3.0 — 2026-09-05
+- `backfill`: reconstruct runs from this machine's Claude Code transcripts
+  for sessions before the plugin was installed, and log them like live runs
+  — same idle rule, same spool, same coverage check (a window an entry
+  already covers is skipped) — marked `backfilled`, which every Shyre view
+  badges. Opt-in, per machine, by hand: `node shyre-hook.mjs backfill
+  --since=2026-09-01 --dry-run` prints the plan; without `--dry-run` it
+  spools and delivers. It reads only the timestamp, the type, whether the line is
+  a tool result, the working directory and the session id of each
+  transcript line; nothing that was said or written is kept or sent. A
+  session still moving — inside the idle cap, or the hooks are writing
+  marks for it — is skipped and named in the plan; run it again later.
+- The entry body has an eleventh field, `backfilled` (false on live runs).
+
 ## 1.2.0 — 2026-09-05
 - An undeliverable run waits thirty days, not seven. The prune still counts
   only sweeps that reached a server which answered, so a closed laptop does

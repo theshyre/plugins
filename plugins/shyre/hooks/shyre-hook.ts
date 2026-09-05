@@ -107,7 +107,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -218,6 +218,9 @@ export interface SpoolItem {
   drop_attempts?: number;
   /** In memory only: this sweep got an answer from the server about this item. */
   contacted?: boolean;
+  /** Reconstructed after the fact by `backfill` from local session history,
+   *  not recorded live. Sent as the eleventh field; the server badges it. */
+  backfilled?: boolean;
   /** The run's marks, LOCAL ONLY: never sent as such. Absent on items an
    *  older runtime wrote; such an item is posted on what it has. */
   marks?: Mark[];
@@ -238,6 +241,7 @@ export interface EntryBodyInput {
   agent_runtime_min?: number | undefined;
   agent_wait_min?: number | undefined;
   prompt_marks?: string[] | undefined;
+  backfilled?: boolean | undefined;
 }
 
 /** The ten fields the server receives, and nothing else. */
@@ -254,6 +258,8 @@ export interface EntryBody {
   /** Instants a prompt was sent inside the window. Absent when the item
    *  carries no marks (an older spool item), never invented. */
   prompt_marks: string[] | undefined;
+  /** The eleventh field: true only for entries `backfill` reconstructed. */
+  backfilled: boolean;
 }
 
 type Env = Record<string, string | undefined>;
@@ -463,19 +469,22 @@ export function segmentRuns(marks: readonly Mark[], capSeconds: number): Run[] {
   return runs;
 }
 
-/** The ten fields the server receives, and nothing else. */
+/** The eleven fields the server receives, and nothing else. */
 export function buildEntryBody(item: EntryBodyInput): EntryBody {
   return {
     project_id: item.project_id,
     start_time: item.start_time,
     end_time: item.end_time,
-    description: `${item.label} session — active time (idle gaps excluded); see transcript`,
+    description: item.backfilled
+      ? `${item.label} session — backfilled from local history after the fact; active time (idle gaps excluded)`
+      : `${item.label} session — active time (idle gaps excluded); see transcript`,
     agent_label: item.label,
     session_ref: item.session_ref,
     idempotency_key: item.idempotency_key,
     agent_runtime_min: item.agent_runtime_min,
     agent_wait_min: item.agent_wait_min,
     prompt_marks: item.prompt_marks,
+    backfilled: item.backfilled === true,
   };
 }
 
@@ -765,12 +774,18 @@ export function gitRemote(cwd: string, env: NodeJS.ProcessEnv = process.env): st
   // a session there is work on the shared project, not the fork.
   for (const name of ["origin", "upstream"]) {
     try {
-      const url = execFileSync("git", ["-C", cwd, "remote", "get-url", name], {
+      // ⚠️ `remote get-url` touches no index, no tty and no network, so a
+      // hostile .git/config (core.fsmonitor, hooks, pagers, credential
+      // helpers) runs nothing — verified 2026-09-05 against a repo wiring
+      // every such key to a marker script. That guarantee is the choice of
+      // subcommand; never grow it into one that refreshes the index or dials
+      // out. fsmonitor is cleared and prompts are refused as standing guards.
+      const url = execFileSync("git", ["-c", "core.fsmonitor=", "-C", cwd, "remote", "get-url", name], {
         encoding: "utf8",
         timeout: 3000,
         stdio: ["ignore", "pipe", "ignore"],
         windowsHide: true,
-        env: clean,
+        env: { ...clean, GIT_TERMINAL_PROMPT: "0" },
       }).trim();
       if (url) return url;
     } catch {
@@ -1225,6 +1240,12 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
       logRefusal(`${tag}\tcovered in part: stood down ${Math.round((we - ws - posted) / 60000)} min already logged; posting ${segments.length} uncovered segment(s)`);
     }
   } else {
+    if (item.backfilled) {
+      // Reconstructed time is not urgent, and the coverage check is the
+      // only thing between it and a double count on another project.
+      logRefusal(`${tag}\t${coverage.reason}; a backfilled run is kept for retry, never posted blind`);
+      return false;
+    }
     logRefusal(`${tag}\t${coverage.reason}; posting without it`);
   }
   const done = new Set(item.done ?? []);
@@ -1286,6 +1307,7 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
       agent_runtime_min: meters?.runtimeMin,
       agent_wait_min: meters?.waitMin,
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : undefined,
+      backfilled: item.backfilled === true,
     });
     const res = await http("POST", `${cfg.apiUrl}/api/v1/entries`, {
       apiKey: cfg.apiKey,
@@ -1376,6 +1398,7 @@ function coerceSpoolItem(value: unknown): SpoolItem | null {
     ...(typeof value.created === "string" ? { created: value.created } : {}),
     ...(typeof value.tries === "number" && Number.isFinite(value.tries) && value.tries >= 0 ? { tries: value.tries } : {}),
     ...(typeof value.drop_attempts === "number" && Number.isFinite(value.drop_attempts) && value.drop_attempts >= 0 ? { drop_attempts: value.drop_attempts } : {}),
+    ...(value.backfilled === true ? { backfilled: true } : {}),
   };
 }
 
@@ -2056,8 +2079,293 @@ async function cmdDoctor(argv: readonly string[] = []): Promise<void> {
 // Entry point
 // ---------------------------------------------------------------------------
 
+// ── backfill: sessions from before the plugin was installed ──────────────
+//
+// The hooks record a session while it runs. Nothing reads a transcript
+// afterward — EXCEPT this command, which the person runs by hand, on one
+// machine, and which reads only what the hooks would have recorded live:
+// the timestamp of each prompt and each agent turn, the working directory
+// (to name the project) and the session id. It never keeps or sends what
+// was said, what was written, or which files were touched; the line is
+// parsed, five fields are taken, the rest is dropped on the spot.
+//
+// The runs it finds go through the same spool and the same coverage check
+// as live runs, so a week already logged by hand is not double-counted,
+// and every entry carries `backfilled: true`, which the server badges.
+
+/** The only transcript fields the backfill takes. Named, so a test can
+ *  hold the parser to this list. `toolUseResult` is read for its PRESENCE
+ *  only: a tool's result comes back as a `type: "user"` line, and counting
+ *  those as prompts turned a tool-call timeline into "the instants you sent
+ *  a prompt" and charged the machine's own gaps to the person (SAL-194). */
+const TRANSCRIPT_FIELDS = ["type", "timestamp", "cwd", "sessionId", "isMeta", "toolUseResult"] as const;
+
+interface TranscriptEvent {
+  type: string;
+  t: number;
+  cwd: string | null;
+  sessionId: string | null;
+  /** A `user` line that is a tool result, not a person typing. */
+  toolResult: boolean;
+}
+
+/** Take the five fields off one transcript line; everything else is dropped here. */
+export function pickTranscriptEvent(line: string): TranscriptEvent | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  const type = typeof parsed[TRANSCRIPT_FIELDS[0]] === "string" ? (parsed[TRANSCRIPT_FIELDS[0]] as string) : "";
+  if (type !== "user" && type !== "assistant") return null;
+  if (parsed[TRANSCRIPT_FIELDS[4]] === true) return null;
+  const ts = typeof parsed[TRANSCRIPT_FIELDS[1]] === "string" ? Date.parse(parsed[TRANSCRIPT_FIELDS[1]] as string) : Number.NaN;
+  if (!Number.isFinite(ts)) return null;
+  const cwd = typeof parsed[TRANSCRIPT_FIELDS[2]] === "string" ? (parsed[TRANSCRIPT_FIELDS[2]] as string) : null;
+  const sid = typeof parsed[TRANSCRIPT_FIELDS[3]] === "string" ? (parsed[TRANSCRIPT_FIELDS[3]] as string) : null;
+  const toolResult = parsed[TRANSCRIPT_FIELDS[5]] !== undefined;
+  return { type, t: ts, cwd, sessionId: sid, toolResult };
+}
+
+/** Marks as the hooks would have written them: a prompt per user line that is not a tool result, a
+ *  tool beat per agent line, and the agent line right before a prompt is
+ *  its stop — the gap that follows was the person's, not the machine's. */
+export function marksFromTranscriptEvents(events: readonly TranscriptEvent[]): Mark[] {
+  const sorted = [...events].sort((a, b) => a.t - b.t);
+  const marks: Mark[] = sorted.map((e) => ({ t: e.t, k: e.type === "user" && !e.toolResult ? "prompt" : "tool" }));
+  for (let i = 1; i < marks.length; i++) {
+    const cur = marks[i];
+    const prev = marks[i - 1];
+    if (cur && prev && cur.k === "prompt" && prev.k === "tool") prev.k = "stop";
+  }
+  return marks;
+}
+
+export interface BackfillOptions {
+  sinceMs: number;
+  untilMs: number;
+  dryRun: boolean;
+  transcriptsDir: string;
+}
+
+function optionValue(argv: readonly string[], name: string): string | null {
+  const hit = argv.find((a) => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : null;
+}
+
+export function backfillOptions(argv: readonly string[], env: Record<string, string | undefined> = process.env, now = Date.now()): BackfillOptions {
+  const since = optionValue(argv, "since");
+  const until = optionValue(argv, "until");
+  const sinceMs = since ? Date.parse(since) : now - 30 * 86400 * 1000;
+  const untilMs = until ? Date.parse(until) : now;
+  if (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs) || sinceMs >= untilMs) {
+    throw new Error("backfill: --since and --until must be dates (YYYY-MM-DD), since before until");
+  }
+  const explicit = optionValue(argv, "transcripts");
+  const configDir = env.CLAUDE_CONFIG_DIR && env.CLAUDE_CONFIG_DIR.trim() ? env.CLAUDE_CONFIG_DIR : join(homedir(), ".claude");
+  return { sinceMs, untilMs, dryRun: argv.includes("--dry-run"), transcriptsDir: explicit ?? join(configDir, "projects") };
+}
+
+interface BackfillSession {
+  sessionId: string;
+  cwd: string | null;
+  events: TranscriptEvent[];
+}
+
+/** Read every transcript under the directory into sessions, timestamps only. */
+export function readTranscriptSessions(dir: string, sinceMs: number, untilMs: number): BackfillSession[] {
+  const sessions = new Map<string, BackfillSession>();
+  let projects: string[] = [];
+  try {
+    projects = readdirSync(dir).sort();
+  } catch {
+    return [];
+  }
+  for (const project of projects) {
+    const projectDir = join(dir, project);
+    let files: string[] = [];
+    try {
+      files = readdirSync(projectDir).filter((f) => f.endsWith(".jsonl")).sort();
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const path = join(projectDir, file);
+      try {
+        // A transcript last written before the window holds nothing in it:
+        // a file's mtime is never earlier than its last line's timestamp
+        // unless something rewrote the mtime by hand, and a machine holding
+        // hundreds of transcripts should not be read whole for a week's
+        // window. Sorted order above makes "first cwd seen wins" stable.
+        if (statSync(path).mtimeMs < sinceMs) continue;
+      } catch {
+        continue;
+      }
+      let text: string;
+      try {
+        text = readFileSync(path, "utf8");
+      } catch (err) {
+        // Said, not swallowed: a transcript this runtime cannot read is a
+        // session's time lost, and silence here is the failure.
+        logRefusal(`backfill\t${path}\tcould not be read, skipped: ${errorMessage(err)}`);
+        continue;
+      }
+      const fallbackId = file.replace(/\.jsonl$/, "");
+      for (const line of text.split("\n")) {
+        if (!line) continue;
+        const ev = pickTranscriptEvent(line);
+        if (!ev) continue;
+        if (ev.t < sinceMs || ev.t >= untilMs) continue;
+        const id = ev.sessionId ?? fallbackId;
+        let session = sessions.get(id);
+        if (!session) {
+          session = { sessionId: id, cwd: null, events: [] };
+          sessions.set(id, session);
+        }
+        if (session.cwd === null && ev.cwd) session.cwd = ev.cwd;
+        session.events.push(ev);
+      }
+    }
+  }
+  return [...sessions.values()];
+}
+
+export interface BackfillPlan {
+  sessions: number;
+  runs: SpoolItem[];
+  unmapped: number;
+  /** Sessions left alone because they are still moving — named, so a
+   *  withheld session is never a silent gap in "runs found". */
+  skipped: string[];
+}
+
+/** True when the hooks are still writing marks for the session on this
+ *  machine: its `.marks` file moved inside the idle cap. A `.meta.json`
+ *  alone is not that — a session killed hard leaves one behind until the
+ *  weekly prune, and its lost time is exactly what the backfill is for. */
+export function hooksSessionMoving(sessionId: string, nowMs: number, idleCapMs: number): boolean {
+  try {
+    const marks = `${stateBase("claude", sessionId)}.marks`;
+    if (!existsSync(marks)) return false;
+    return nowMs - statSync(marks).mtimeMs < idleCapMs;
+  } catch {
+    return false;
+  }
+}
+
+export function planBackfill(sessions: readonly BackfillSession[], idleCapSeconds: number, createdIso = nowIso(), nowMs = Date.now(), liveSession: (sessionId: string, nowMs: number, idleCapMs: number) => boolean = hooksSessionMoving): BackfillPlan {
+  const runs: SpoolItem[] = [];
+  const skipped: string[] = [];
+  const idleCapMs = idleCapSeconds * 1000;
+  let unmapped = 0;
+  for (const session of sessions) {
+    if (session.events.length === 0) continue;
+    // A session still moving inside the idle cap, or one the hooks are
+    // writing marks for, is being recorded live: the backfill must not land
+    // first and leave the hooks' own run badged as reconstructed. It is
+    // named in the plan, not dropped: the user runs backfill again later.
+    const newest = session.events.reduce((m, e) => (e.t > m ? e.t : m), 0);
+    if (nowMs - newest < idleCapMs || liveSession(session.sessionId, nowMs, idleCapMs)) {
+      skipped.push(session.sessionId);
+      continue;
+    }
+    const marks = marksFromTranscriptEvents(session.events);
+    const cwd = session.cwd ?? "";
+    let repoKey: string | null = null;
+    if (cwd) {
+      try {
+        repoKey = existsSync(cwd) ? repoKeyFromRemote(gitRemote(cwd)) : null;
+      } catch {
+        repoKey = null;
+      }
+    }
+    const segmented = segmentRuns(marks, idleCapSeconds);
+    // A key that is not owner/repo (a local-path remote) names no project either.
+    if (segmented.length > 0 && (repoKey === null || !REPO_KEY_SHAPE.test(repoKey))) unmapped += 1;
+    for (const run of segmented) {
+      runs.push({
+        agent: "claude",
+        label: AGENT_LABELS.claude,
+        session: session.sessionId,
+        cwd,
+        repo_key: repoKey,
+        start_time: run.start,
+        end_time: run.end,
+        agent_runtime_min: run.runtimeMin,
+        agent_wait_min: run.waitMin,
+        marks: run.marks,
+        // Its own namespace: a live run of the same session keyed on the
+        // same start instant is the same minutes, and the coverage check at
+        // delivery settles that; the key must not replay the live entry.
+        idempotency_key: `backfill:${session.sessionId}:${run.start}`,
+        session_ref: session.sessionId,
+        created: createdIso,
+        backfilled: true,
+      });
+    }
+  }
+  return { sessions: sessions.length, runs, unmapped, skipped };
+}
+
+export function formatBackfillPlan(plan: BackfillPlan, opts: Pick<BackfillOptions, "sinceMs" | "untilMs" | "dryRun">): string {
+  const minutes = plan.runs.reduce((sum, r) => sum + Math.round((Date.parse(r.end_time) - Date.parse(r.start_time)) / 60000), 0);
+  const lines = [
+    `backfill: ${new Date(opts.sinceMs).toISOString().slice(0, 10)} → ${new Date(opts.untilMs).toISOString().slice(0, 10)}${opts.dryRun ? " (dry run — nothing written)" : ""}`,
+    `  sessions with activity: ${plan.sessions}`,
+    `  runs found: ${plan.runs.length} (${minutes} min of active time, idle gaps excluded)`,
+    `  runs on a directory no project names: ${plan.unmapped} session(s) — they will be refused as unmapped and written to the refusals log`,
+    `  skipped as still moving: ${plan.skipped.length} session(s) — inside the idle cap, or the hooks are writing marks for them; run backfill again after they end`,
+  ];
+  for (const r of plan.runs.slice(0, 200)) {
+    // A path-shaped key is a working directory by another name (SAL-192):
+    // printed as (local), never as itself — stdout inside a session lands in
+    // that session's transcript.
+    const shown = r.repo_key && REPO_KEY_SHAPE.test(r.repo_key) ? r.repo_key : r.repo_key ? "(local)" : "(unmapped)";
+    lines.push(`  ${r.start_time}  ${r.end_time}  ${String(r.agent_runtime_min ?? 0).padStart(4)}m working ${String(r.agent_wait_min ?? 0).padStart(4)}m waiting  ${shown}`);
+  }
+  if (plan.runs.length > 200) lines.push(`  … and ${plan.runs.length - 200} more`);
+  return lines.join("\n");
+}
+
+/**
+ * `backfill [--since=YYYY-MM-DD] [--until=YYYY-MM-DD] [--dry-run]
+ * [--transcripts=DIR]` — reconstruct runs from this machine's Claude Code
+ * transcripts and spool them like live runs, marked backfilled. Prints
+ * the plan; with --dry-run, prints and stops.
+ */
+export async function cmdBackfill(argv: readonly string[], cfg: Config): Promise<void> {
+  const opts = backfillOptions(argv);
+  const sessions = readTranscriptSessions(opts.transcriptsDir, opts.sinceMs, opts.untilMs);
+  const plan = planBackfill(sessions, cfg.idleCapSeconds);
+  process.stdout.write(`${formatBackfillPlan(plan, opts)}\n`);
+  if (opts.dryRun) return;
+  // A withheld session is a line in the refusals log, like every other
+  // minute this runtime declines to post.
+  for (const id of plan.skipped) logRefusal(`backfill\t${id}\tskipped: still moving inside the idle cap; run backfill again after it ends`);
+  if (plan.runs.length === 0) return;
+  const dir = spoolDir();
+  let spooled = 0;
+  for (const item of plan.runs) {
+    // The session id came from a transcript line, verbatim; the live path
+    // sanitizes it for the same reason (stateBase). Never a path.
+    const safe = String(item.session).replace(/[^A-Za-z0-9._-]/g, "_");
+    try {
+      writeAtomic(join(dir, `claude-backfill-${safe}-${item.start_time.replace(/[^0-9TZ]/g, "")}.json`), JSON.stringify(item), 0o600);
+      spooled += 1;
+    } catch (err) {
+      logRefusal(`backfill\t${item.session}\t${item.start_time}\tcould not be spooled: ${errorMessage(err)}`);
+    }
+  }
+  // Flush even when nothing new spooled: a full spool directory still holds
+  // earlier runs, and this sweep is as good as any.
+  process.stdout.write(`  spooled ${spooled} run(s); delivering now — a window an entry already covers is skipped, and anything refused is in the refusals log.\n`);
+  await cmdFlush(cfg);
+}
+
 /** The interactive commands: errors reach the terminal and the exit code. */
-const INTERACTIVE = new Set(["install", "doctor"]);
+const INTERACTIVE = new Set(["install", "doctor", "backfill"]);
 
 export async function main(argv: readonly string[]): Promise<void> {
   const positional = argv.filter((a) => !a.startsWith("--"));
@@ -2065,6 +2373,7 @@ export async function main(argv: readonly string[]): Promise<void> {
   const cfg = readConfig();
   if (first === "flush") return cmdFlush(cfg);
   if (first === "doctor") return cmdDoctor(argv);
+  if (first === "backfill") return cmdBackfill(argv, cfg);
   if (first === "install") {
     const uninstall = argv.includes("--uninstall");
     const apiUrl = installOrigin(argv);
