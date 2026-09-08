@@ -2,10 +2,7 @@
   "mcpServers": {
     "shyre": {
       "type": "http",
-      "url": "https://shyre.io/api/mcp",
-      "headers": {
-        "Authorization": "Bearer ${SHYRE_API_KEY}"
-      }
+      "url": "https://shyre.io/api/mcp"
     }
   }
 }

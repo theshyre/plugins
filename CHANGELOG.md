@@ -4,6 +4,16 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.5.0 — 2026-09-08
+
+- **The MCP server signs in.** `.mcp.json` no longer sends a bearer token:
+  the first time a session uses a Shyre tool, Claude Code opens the browser
+  (`/mcp` → Authenticate), you pick the team and click Allow, and the agent
+  holds a token nobody typed — listed under Settings → Integrations as
+  *Claude Code — <date>*, revocable there. The hooks are unchanged and still
+  read `SHYRE_API_KEY` from the shell that launches `claude`: a hook has no
+  browser. The runtime's behavior is unchanged; only its version string moved.
+
 ## 1.4.0 — 2026-09-08
 
 - **The third meter: tokens.** At session end the hook reads the agent's own
