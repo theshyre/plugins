@@ -107,7 +107,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.3.0";
+export const VERSION = "1.4.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -209,6 +209,13 @@ export interface SpoolItem {
   agent_wait_min: number | undefined;
   idempotency_key: string;
   session_ref: string;
+  /** The third meter, scraped from the agent's own exporter at session end
+   *  and attached to the LAST run of the session (the counters are
+   *  cumulative for the process; there is no honest way to apportion them
+   *  across runs, so the run that ends the session carries them). Absent
+   *  when the exporter was off, another session held the port, or the scrape
+   *  named a different session — never zero. */
+  agent_tokens?: AgentTokens | undefined;
   created?: string;
   /** Sweeps that reached the server about this item and kept it. */
   tries?: number;
@@ -231,6 +238,23 @@ export interface SpoolItem {
   done?: string[];
 }
 
+/** What the exporter said about THIS session, and nothing about the account
+ *  it belongs to. The scrape also carries the account email, the organization
+ *  id and the user id; those never leave the machine. */
+export interface AgentTokens {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_creation: number;
+  /** The model that spent the most of them. A session that used several
+   *  reports the dominant one and its counts — tokens are per model, and a
+   *  sum across models is a number with no unit. */
+  model: string;
+  /** The client's list-price valuation for the whole session, all models. An
+   *  estimate, never an expense: a Max subscriber's payable is zero. */
+  cost_usd_list: number;
+}
+
 export interface EntryBodyInput {
   project_id: string;
   label: string;
@@ -242,9 +266,10 @@ export interface EntryBodyInput {
   agent_wait_min?: number | undefined;
   prompt_marks?: string[] | undefined;
   backfilled?: boolean | undefined;
+  agent_tokens?: AgentTokens | undefined;
 }
 
-/** The ten fields the server receives, and nothing else. */
+/** The fourteen fields the server receives, and nothing else. */
 export interface EntryBody {
   project_id: string;
   start_time: string;
@@ -260,6 +285,12 @@ export interface EntryBody {
   prompt_marks: string[] | undefined;
   /** The eleventh field: true only for entries `backfill` reconstructed. */
   backfilled: boolean;
+  /** Twelve to fourteen: the third meter. Counts by type as the exporter
+   *  labels them; the model; the list-price figure. Absent, never zero, when
+   *  the session reported nothing. */
+  agent_tokens: { input: number; output: number; cache_read: number; cache_creation: number } | undefined;
+  agent_model: string | undefined;
+  agent_cost_usd_list: number | undefined;
 }
 
 type Env = Record<string, string | undefined>;
@@ -485,6 +516,11 @@ export function buildEntryBody(item: EntryBodyInput): EntryBody {
     agent_wait_min: item.agent_wait_min,
     prompt_marks: item.prompt_marks,
     backfilled: item.backfilled === true,
+    agent_tokens: item.agent_tokens
+      ? { input: item.agent_tokens.input, output: item.agent_tokens.output, cache_read: item.agent_tokens.cache_read, cache_creation: item.agent_tokens.cache_creation }
+      : undefined,
+    agent_model: item.agent_tokens?.model,
+    agent_cost_usd_list: item.agent_tokens?.cost_usd_list,
   };
 }
 
@@ -984,7 +1020,134 @@ function coerceMeta(value: unknown, fallbackAgent: Agent, fallbackSession: strin
 
 /** SessionEnd. Spools one item per run; no network. A second source firing
  *  the same end (Cursor + the Claude plugin) finds no state and does nothing. */
-export function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: Pick<Config, "idleCapSeconds">): void {
+/**
+ * Read the third meter off the agent's own exporter.
+ *
+ * ⚠️ LOCALHOST, NO HEADERS, NOT THROUGH `http()`. That helper attaches the
+ * bearer token to every request; this one must never carry it, because the
+ * port is whatever is listening on the machine. Claude Code serves
+ * `claude_code_token_usage_total` by `type` and `claude_code_cost_usage_total`
+ * on `OTEL_EXPORTER_PROMETHEUS_PORT` (9464) when launched with
+ * `CLAUDE_CODE_ENABLE_TELEMETRY=1 OTEL_METRICS_EXPORTER=prometheus`.
+ *
+ * ⚠️ OWN SESSION ONLY. The exporter is first-come: a second concurrent
+ * session runs normally and binds nothing, so a scrape can answer with
+ * ANOTHER session's numbers. Every line is filtered on `session_id`, and a
+ * scrape that names no line for this session is "absent" — the same answer
+ * as no listener, a parse failure, or the port taken by something else.
+ * Absent is absent; it is never reported as zero.
+ *
+ * The counters are cumulative for the process. A `--resume` reuses the
+ * session id in a fresh process that starts at zero, which is fine: this
+ * reads once, at the end, and attaches to that end.
+ */
+/** The exporter's port, or null when the variable is not a port number. */
+export function prometheusPort(env: Record<string, string | undefined>): number | null {
+  const raw = (env.OTEL_EXPORTER_PROMETHEUS_PORT ?? "").trim();
+  if (raw === "") return 9464;
+  if (!/^\d{1,5}$/.test(raw)) return null;
+  const port = Number(raw);
+  return port >= 1 && port <= 65535 ? port : null;
+}
+
+/** More than this from a localhost port is not a metrics page; stop reading. */
+const SCRAPE_MAX_BYTES = 1_048_576;
+
+export async function scrapeSessionTokens(session: string, fetchImpl: typeof fetch = fetch): Promise<AgentTokens | undefined> {
+  const port = prometheusPort(process.env);
+  if (port === null) return undefined;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 500);
+  let text = "";
+  try {
+    const res = await fetchImpl(`http://127.0.0.1:${port}/metrics`, { method: "GET", signal: ctl.signal, redirect: "manual" });
+    if (res.status !== 200 || !res.body) return undefined;
+    // Read with a ceiling: whatever holds the port decides how much it sends.
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > SCRAPE_MAX_BYTES) {
+        ctl.abort();
+        return undefined;
+      }
+      chunks.push(value);
+    }
+    text = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+  return parseSessionTokens(text, session);
+}
+
+/** The index of the `}` that closes the label set — quote-aware, so a `}`
+ *  inside a quoted label value, or an OpenMetrics exemplar after the value,
+ *  cannot move it. -1 when the set never closes. */
+export function labelSetClose(line: string, open: number): number {
+  let quoted = false;
+  for (let i = open + 1; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === "}") return i;
+  }
+  return -1;
+}
+
+/** Pure: the exporter's text → this session's counts, or nothing. */
+export function parseSessionTokens(text: string, session: string): AgentTokens | undefined {
+  const byModel = new Map<string, { input: number; output: number; cache_read: number; cache_creation: number }>();
+  let cost = 0;
+  let sawCost = false;
+  const typeKey: Record<string, keyof AgentTokens> = { input: "input", output: "output", cacheRead: "cache_read", cacheCreation: "cache_creation" };
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line.startsWith("claude_code_token_usage_total{") && !line.startsWith("claude_code_cost_usage_total{")) continue;
+    const brace = line.indexOf("{");
+    const close = labelSetClose(line, brace);
+    if (brace < 0 || close < brace) continue;
+    const labels: Record<string, string> = {};
+    for (const m of line.slice(brace + 1, close).matchAll(/([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"/g)) labels[m[1] ?? ""] = (m[2] ?? "").replace(/\\(["\\])/g, "$1");
+    if (labels.session_id !== session) continue;
+    const value = Number(line.slice(close + 1).trim().split(/\s+/)[0]);
+    if (!Number.isFinite(value) || value < 0) continue;
+    if (line.startsWith("claude_code_cost_usage_total{")) {
+      cost += value;
+      sawCost = true;
+      continue;
+    }
+    const model = labels.model ?? "";
+    const key = typeKey[labels.type ?? ""];
+    if (!key || !model || key === "model" || key === "cost_usd_list") continue;
+    // A counter that never incremented is not exported at all, so a type
+    // with no line is a true zero for THIS session (a session with no cache
+    // writes has no cacheCreation series). Different from the row, where a
+    // NULL means "not reported": here presence of the metric at all is the
+    // report, and the counts are whatever it says.
+    const bucket = byModel.get(model) ?? { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+    bucket[key] += Math.round(value);
+    byModel.set(model, bucket);
+  }
+  if (byModel.size === 0) return undefined;
+  // The dominant model carries the counts. Tokens are per model; a sum across
+  // models is a number with no unit.
+  const [model, counts] = [...byModel.entries()].sort((a, b) => total(b[1]) - total(a[1]))[0] ?? [undefined, undefined];
+  if (!model || !counts) return undefined;
+  return { ...counts, model, cost_usd_list: sawCost ? Math.round(cost * 1e6) / 1e6 : 0 };
+}
+
+function total(c: { input: number; output: number; cache_read: number; cache_creation: number }): number {
+  return c.input + c.output + c.cache_read + c.cache_creation;
+}
+
+export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: Pick<Config, "idleCapSeconds">, scrape: (session: string) => Promise<AgentTokens | undefined> = scrapeSessionTokens): Promise<void> {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -1016,6 +1179,9 @@ export function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: 
     marksText = "";
   }
   const runs = segmentRuns(parseMarks(marksText), idleCapSeconds);
+  // The third meter, read while the agent's process is still alive and its
+  // exporter still bound. Attached to the last run only — see SpoolItem.
+  let last: { path: string; item: SpoolItem } | undefined;
   for (const run of runs) {
     const item: SpoolItem = {
       agent: meta.agent,
@@ -1036,7 +1202,22 @@ export function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: 
       session_ref: session,
       created: nowIso(),
     };
-    writeAtomic(join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`), JSON.stringify(item), 0o600);
+    const path = join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`);
+    writeAtomic(path, JSON.stringify(item), 0o600);
+    last = { path, item };
+  }
+  // ⚠️ SPOOL FIRST, SCRAPE SECOND. The hours are on disk before anything
+  // waits on a socket: a SessionEnd killed inside the half-second scrape
+  // (terminal closed, hook timeout) loses the tokens, never the run. The
+  // third meter rides the LAST run only — see SpoolItem.agent_tokens.
+  if (last) {
+    let tokens: AgentTokens | undefined;
+    try {
+      tokens = await scrape(session);
+    } catch {
+      tokens = undefined;
+    }
+    if (tokens) writeAtomic(last.path, JSON.stringify({ ...last.item, agent_tokens: tokens }), 0o600);
   }
   try {
     unlinkSync(`${base}.marks`);
@@ -1308,6 +1489,9 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
       agent_wait_min: meters?.waitMin,
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : undefined,
       backfilled: item.backfilled === true,
+      // A split run's tokens cannot be apportioned to one of its segments;
+      // only the whole run carries them.
+      agent_tokens: whole ? item.agent_tokens : undefined,
     });
     const res = await http("POST", `${cfg.apiUrl}/api/v1/entries`, {
       apiKey: cfg.apiKey,
@@ -1994,6 +2178,29 @@ export function cmdInstall(agent: string | undefined, opts: InstallOptions = { a
 }
 
 /** The doctor's lines; each computed on its own, so one failure does not hide the rest. */
+/**
+ * The third meter's one line of advice. It never proposes overriding an
+ * exporter someone else configured: `OTEL_METRICS_EXPORTER` set to anything
+ * without `prometheus` in it is that person's choice, and the line says the
+ * meter is not read, not "change this".
+ */
+export function tokensDoctorLine(env: Record<string, string | undefined>): string {
+  const exporter = (env.OTEL_METRICS_EXPORTER ?? "").trim();
+  const prometheus = exporter.split(",").map((e) => e.trim().toLowerCase()).includes("prometheus");
+  const telemetry = (env.CLAUDE_CODE_ENABLE_TELEMETRY ?? "").trim() === "1";
+  const port = prometheusPort(env);
+  if (telemetry && prometheus && port === null) {
+    return `tokens: OTEL_EXPORTER_PROMETHEUS_PORT=${env.OTEL_EXPORTER_PROMETHEUS_PORT ?? ""} is not a port — the third meter is not read until it is one (1–65535)`;
+  }
+  if (telemetry && prometheus) {
+    return `tokens: exporter on (127.0.0.1:${port}) — the third meter is read once, at session end, for this session's id only; one session per machine binds the port, the rest report nothing`;
+  }
+  if (exporter && !prometheus) {
+    return `tokens: OTEL_METRICS_EXPORTER=${exporter} is another exporter — left alone; the third meter is not read`;
+  }
+  return "tokens: off — to record the third meter, export CLAUDE_CODE_ENABLE_TELEMETRY=1 and OTEL_METRICS_EXPORTER=prometheus before starting the agent (nothing leaves the machine but four counts, a model name and one list-price figure)";
+}
+
 export async function doctorLines(cfg: Config, cwd: string = process.cwd(), probe: boolean = cfg.apiUrl === DEFAULT_API_URL): Promise<string[]> {
   const lines: string[] = [`shyre-hook ${VERSION}`, `home: ${shyreHome()}`];
   const attempt = (label: string, fn: () => string): void => {
@@ -2014,6 +2221,7 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
   attempt("tls", () => (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 — the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on"));
+  attempt("tokens", () => tokensDoctorLine(process.env));
   // The repository the current directory is in, and whether anything names it.
   const remote = gitRemote(cwd);
   const repoKey = repoKeyFromRemote(remote);

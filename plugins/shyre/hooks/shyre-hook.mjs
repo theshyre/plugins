@@ -110,7 +110,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.3.0";
+var VERSION = "1.4.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -288,7 +288,10 @@ function buildEntryBody(item) {
     agent_runtime_min: item.agent_runtime_min,
     agent_wait_min: item.agent_wait_min,
     prompt_marks: item.prompt_marks,
-    backfilled: item.backfilled === true
+    backfilled: item.backfilled === true,
+    agent_tokens: item.agent_tokens ? { input: item.agent_tokens.input, output: item.agent_tokens.output, cache_read: item.agent_tokens.cache_read, cache_creation: item.agent_tokens.cache_creation } : void 0,
+    agent_model: item.agent_tokens?.model,
+    agent_cost_usd_list: item.agent_tokens?.cost_usd_list
   };
 }
 function uncoveredSegments(entries, start, end, nowIso2 = (/* @__PURE__ */ new Date()).toISOString()) {
@@ -622,7 +625,93 @@ function coerceMeta(value, fallbackAgent, fallbackSession) {
     repoKey: typeof value.repoKey === "string" ? value.repoKey : null
   };
 }
-function cmdEnd(argvAgent, payload, { idleCapSeconds }) {
+function prometheusPort(env) {
+  const raw = (env.OTEL_EXPORTER_PROMETHEUS_PORT ?? "").trim();
+  if (raw === "") return 9464;
+  if (!/^\d{1,5}$/.test(raw)) return null;
+  const port = Number(raw);
+  return port >= 1 && port <= 65535 ? port : null;
+}
+var SCRAPE_MAX_BYTES = 1048576;
+async function scrapeSessionTokens(session, fetchImpl = fetch) {
+  const port = prometheusPort(process.env);
+  if (port === null) return void 0;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 500);
+  let text = "";
+  try {
+    const res = await fetchImpl(`http://127.0.0.1:${port}/metrics`, { method: "GET", signal: ctl.signal, redirect: "manual" });
+    if (res.status !== 200 || !res.body) return void 0;
+    const reader = res.body.getReader();
+    const chunks = [];
+    let size = 0;
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > SCRAPE_MAX_BYTES) {
+        ctl.abort();
+        return void 0;
+      }
+      chunks.push(value);
+    }
+    text = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+  } catch {
+    return void 0;
+  } finally {
+    clearTimeout(timer);
+  }
+  return parseSessionTokens(text, session);
+}
+function labelSetClose(line, open) {
+  let quoted = false;
+  for (let i = open + 1; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted) {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') quoted = false;
+    } else if (ch === '"') quoted = true;
+    else if (ch === "}") return i;
+  }
+  return -1;
+}
+function parseSessionTokens(text, session) {
+  const byModel = /* @__PURE__ */ new Map();
+  let cost = 0;
+  let sawCost = false;
+  const typeKey = { input: "input", output: "output", cacheRead: "cache_read", cacheCreation: "cache_creation" };
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (!line.startsWith("claude_code_token_usage_total{") && !line.startsWith("claude_code_cost_usage_total{")) continue;
+    const brace = line.indexOf("{");
+    const close = labelSetClose(line, brace);
+    if (brace < 0 || close < brace) continue;
+    const labels = {};
+    for (const m of line.slice(brace + 1, close).matchAll(/([A-Za-z_][A-Za-z0-9_]*)="((?:[^"\\]|\\.)*)"/g)) labels[m[1] ?? ""] = (m[2] ?? "").replace(/\\(["\\])/g, "$1");
+    if (labels.session_id !== session) continue;
+    const value = Number(line.slice(close + 1).trim().split(/\s+/)[0]);
+    if (!Number.isFinite(value) || value < 0) continue;
+    if (line.startsWith("claude_code_cost_usage_total{")) {
+      cost += value;
+      sawCost = true;
+      continue;
+    }
+    const model2 = labels.model ?? "";
+    const key = typeKey[labels.type ?? ""];
+    if (!key || !model2 || key === "model" || key === "cost_usd_list") continue;
+    const bucket = byModel.get(model2) ?? { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+    bucket[key] += Math.round(value);
+    byModel.set(model2, bucket);
+  }
+  if (byModel.size === 0) return void 0;
+  const [model, counts] = [...byModel.entries()].sort((a, b) => total(b[1]) - total(a[1]))[0] ?? [void 0, void 0];
+  if (!model || !counts) return void 0;
+  return { ...counts, model, cost_usd_list: sawCost ? Math.round(cost * 1e6) / 1e6 : 0 };
+}
+function total(c) {
+  return c.input + c.output + c.cache_read + c.cache_creation;
+}
+async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSessionTokens) {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -651,6 +740,7 @@ function cmdEnd(argvAgent, payload, { idleCapSeconds }) {
     marksText = "";
   }
   const runs = segmentRuns(parseMarks(marksText), idleCapSeconds);
+  let last;
   for (const run of runs) {
     const item = {
       agent: meta.agent,
@@ -671,7 +761,18 @@ function cmdEnd(argvAgent, payload, { idleCapSeconds }) {
       session_ref: session,
       created: nowIso()
     };
-    writeAtomic(join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`), JSON.stringify(item), 384);
+    const path = join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`);
+    writeAtomic(path, JSON.stringify(item), 384);
+    last = { path, item };
+  }
+  if (last) {
+    let tokens;
+    try {
+      tokens = await scrape(session);
+    } catch {
+      tokens = void 0;
+    }
+    if (tokens) writeAtomic(last.path, JSON.stringify({ ...last.item, agent_tokens: tokens }), 384);
   }
   try {
     unlinkSync(`${base}.marks`);
@@ -839,7 +940,10 @@ async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we) 
       agent_runtime_min: meters?.runtimeMin,
       agent_wait_min: meters?.waitMin,
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : void 0,
-      backfilled: item.backfilled === true
+      backfilled: item.backfilled === true,
+      // A split run's tokens cannot be apportioned to one of its segments;
+      // only the whole run carries them.
+      agent_tokens: whole ? item.agent_tokens : void 0
     });
     const res = await http("POST", `${cfg.apiUrl}/api/v1/entries`, {
       apiKey: cfg.apiKey,
@@ -1338,6 +1442,22 @@ function cmdInstall(agent, opts = { apiUrl: DEFAULT_API_URL, uninstall: false })
   }
   throw new Error(`no installer for "${agent ?? ""}" yet (supported: codex, cursor; Claude Code uses the plugin)`);
 }
+function tokensDoctorLine(env) {
+  const exporter = (env.OTEL_METRICS_EXPORTER ?? "").trim();
+  const prometheus = exporter.split(",").map((e) => e.trim().toLowerCase()).includes("prometheus");
+  const telemetry = (env.CLAUDE_CODE_ENABLE_TELEMETRY ?? "").trim() === "1";
+  const port = prometheusPort(env);
+  if (telemetry && prometheus && port === null) {
+    return `tokens: OTEL_EXPORTER_PROMETHEUS_PORT=${env.OTEL_EXPORTER_PROMETHEUS_PORT ?? ""} is not a port \u2014 the third meter is not read until it is one (1\u201365535)`;
+  }
+  if (telemetry && prometheus) {
+    return `tokens: exporter on (127.0.0.1:${port}) \u2014 the third meter is read once, at session end, for this session's id only; one session per machine binds the port, the rest report nothing`;
+  }
+  if (exporter && !prometheus) {
+    return `tokens: OTEL_METRICS_EXPORTER=${exporter} is another exporter \u2014 left alone; the third meter is not read`;
+  }
+  return "tokens: off \u2014 to record the third meter, export CLAUDE_CODE_ENABLE_TELEMETRY=1 and OTEL_METRICS_EXPORTER=prometheus before starting the agent (nothing leaves the machine but four counts, a model name and one list-price figure)";
+}
 async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFAULT_API_URL) {
   const lines = [`shyre-hook ${VERSION}`, `home: ${shyreHome()}`];
   const attempt = (label, fn) => {
@@ -1357,6 +1477,7 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
   attempt("tls", () => process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 \u2014 the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on");
+  attempt("tokens", () => tokensDoctorLine(process.env));
   const remote = gitRemote(cwd);
   const repoKey = repoKeyFromRemote(remote);
   const mapFile = readMapFileFrom();
@@ -1695,6 +1816,7 @@ export {
   installCursor,
   installOrigin,
   isAgent,
+  labelSetClose,
   logRefusal,
   main,
   mapFileCandidates,
@@ -1703,16 +1825,20 @@ export {
   nodeCommand,
   normalizePayload,
   parseMarks,
+  parseSessionTokens,
   pickTranscriptEvent,
   planBackfill,
+  prometheusPort,
   promptMarksFor,
   readConfig,
   readTranscriptSessions,
   refusalLogPath,
   repoKeyFromRemote,
   resolveFromMap,
+  scrapeSessionTokens,
   segmentRuns,
   shyreHome,
+  tokensDoctorLine,
   uncoveredMillis,
   uncoveredSegments,
   uninstallCodex,

@@ -4,6 +4,22 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.4.0 — 2026-09-08
+
+- **The third meter: tokens.** At session end the hook reads the agent's own
+  metrics exporter on `127.0.0.1` (Claude Code's Prometheus endpoint, on when
+  the agent is started with `CLAUDE_CODE_ENABLE_TELEMETRY=1
+  OTEL_METRICS_EXPORTER=prometheus`) and sends three more fields on the last
+  run of the session: `agent_tokens` (input, output, cache read, cache
+  creation, for the model that spent the most), `agent_model`, and
+  `agent_cost_usd_list` — the client's own list-price figure, an estimate.
+  Own session only: a line for any other session id is dropped, so a machine
+  running two agents reports tokens for the one that bound the port and
+  nothing for the other. Absent is absent, never zero. The request carries no
+  headers — the bearer token never reaches the port.
+- `shyre-hook doctor` prints a `tokens:` line: on, off with the two variables
+  to export, or "another exporter — left alone".
+
 ## 1.3.0 — 2026-09-05
 - `backfill`: reconstruct runs from this machine's Claude Code transcripts
   for sessions before the plugin was installed, and log them like live runs
