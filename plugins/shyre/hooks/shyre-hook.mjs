@@ -119,7 +119,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.6.0";
+var VERSION = "1.6.1";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",

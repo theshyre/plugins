@@ -4,6 +4,16 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.6.1 — 2026-09-09
+
+- **The README caught up.** The repository's front page still described
+  1.0.2 — no checkpoints, no browser sign-in for the MCP server, no
+  auto-update note, the old domain — while five releases went by. It now
+  describes the plugin that ships, names the release it belongs to, and a
+  test in the Shyre repository refuses a version bump that leaves either
+  README untouched. The manifest's homepage is `https://shyre.io`. The
+  runtime's behavior is unchanged; only its version string moved.
+
 ## 1.6.0 — 2026-09-09
 
 - **Time shows up while you work.** Before this, every run waited for
