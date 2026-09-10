@@ -5,7 +5,7 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.6.1 (2026-09-09) — see `../../CHANGELOG.md`.
+**Latest release:** 1.7.0 (2026-09-10) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
@@ -17,7 +17,13 @@ Then turn on auto-update for the marketplace once — `/plugin` → **Marketplac
 launch. Claude Code leaves auto-update off for every marketplace that is
 not Anthropic's, and nothing a plugin ships can change that; until you flip
 it, the plugin tells the agent at session start that it is off (once a day)
-and when a newer version exists.
+and when a newer version exists. It also says so when the token itself is
+the problem: `SHYRE_API_KEY` refuses with a 401 on rotation or expiry the
+same as on revocation, and a 401 never drops a spooled run — but after three
+refused deliveries in a row, session start reports how many times and since
+when, and points at `/settings/integrations` to re-mint it; the spooled
+runs are kept and post once a working key is in place. `doctor` shows the
+same streak on its `token:` line.
 
 The MCP tools sign in on first use: Claude Code opens a browser tab (`/mcp`
 → Authenticate), you pick the team and click **Allow**, and the agent holds

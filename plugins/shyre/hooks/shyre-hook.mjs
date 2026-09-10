@@ -119,7 +119,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.6.1";
+var VERSION = "1.7.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -528,7 +528,31 @@ function readMapFileFrom() {
 function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
 }
-async function http(method, url, { apiKey, agent, session, body }) {
+function tokenRefusalStatePath() {
+  return join(shyreHome(), "token-refusals.json");
+}
+function readTokenRefusalState() {
+  try {
+    const parsed = JSON.parse(readFileSync(tokenRefusalStatePath(), "utf8"));
+    if (isRecord(parsed) && typeof parsed.count === "number" && Number.isFinite(parsed.count) && parsed.count >= 0 && typeof parsed.since === "string") {
+      return { count: parsed.count, since: parsed.since };
+    }
+  } catch {
+  }
+  return { count: 0, since: "" };
+}
+function recordTokenAnswer(status) {
+  try {
+    if (status === 401) {
+      const state = readTokenRefusalState();
+      writeAtomic(tokenRefusalStatePath(), JSON.stringify({ count: state.count + 1, since: state.count > 0 ? state.since : nowIso() }), 384);
+    } else if (status >= 200 && status < 300) {
+      if (readTokenRefusalState().count > 0) writeAtomic(tokenRefusalStatePath(), JSON.stringify({ count: 0, since: "" }), 384);
+    }
+  } catch {
+  }
+}
+async function http(method, url, { apiKey, agent, session, body, trackHealth = true }) {
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && url.startsWith("https:")) {
     return { status: 0, json: null, text: "refusing to send the token while NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate checks" };
   }
@@ -558,6 +582,7 @@ async function http(method, url, { apiKey, agent, session, body }) {
     } catch {
       json = null;
     }
+    if (trackHealth) recordTokenAnswer(res.status);
     return { status: res.status, json, text };
   } catch (err) {
     return { status: 0, json: null, text: errorMessage(err) };
@@ -617,7 +642,7 @@ function cmdStart(argvAgent, payload, announce = false) {
   }
   appendFileSync(`${base}.marks`, `${nowIso()} start
 `, { mode: 384 });
-  const notices = announce ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd())].filter((n) => n !== null) : [];
+  const notices = announce ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n) => n !== null) : [];
   for (const notice of notices) {
     try {
       process.stdout.write(`${notice}
@@ -1302,6 +1327,12 @@ function staleNotice(agent = "claude", env = process.env, apiUrl = DEFAULT_API_U
   const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins \u2014 or turn on auto-update once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update." : agent === "codex" || agent === "cursor" ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.` : `Replace the runtime: ${download}.`;
   return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
 }
+var TOKEN_REFUSAL_NOTICE_THRESHOLD = 3;
+function tokenRefusalNotice() {
+  const state = readTokenRefusalState();
+  if (state.count < TOKEN_REFUSAL_NOTICE_THRESHOLD) return null;
+  return `Shyre: the token has been refused ${state.count} times in a row since ${state.since} \u2014 re-mint it at /settings/integrations. The spooled runs are kept and will post once a working key is in place. Tell the person.`;
+}
 async function cmdFlush(cfg) {
   const dir = spoolDir();
   if (cfg.apiKey) await probeLatestVersion(cfg);
@@ -1727,7 +1758,12 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
     }
   };
   attempt("api", () => `api: ${cfg.apiUrl}${cfg.apiUrl === DEFAULT_API_URL ? "" : `   WARNING: not the default ${DEFAULT_API_URL} \u2014 set by SHYRE_API_URL or ~/.shyre/config.json; the token is sent here`}`);
-  attempt("token", () => `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}\u2026)` : "MISSING \u2014 export SHYRE_API_KEY or write ~/.shyre/config.json"}`);
+  attempt("token", () => {
+    const base = cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}\u2026)` : "MISSING \u2014 export SHYRE_API_KEY or write ~/.shyre/config.json";
+    const refused = readTokenRefusalState();
+    if (refused.count === 0) return `token: ${base}`;
+    return `token: ${base} \u2014 refused ${refused.count} time${refused.count === 1 ? "" : "s"} since ${refused.since}; re-mint at /settings/integrations`;
+  });
   attempt("config file", () => {
     const configPath = join(shyreHome(), "config.json");
     const mode = modeOf(configPath);
@@ -1762,7 +1798,7 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
     lines.push(`server: not asked \u2014 the origin is not the default; run doctor --probe to send the token to ${cfg.apiUrl}`);
   } else if (cfg.apiKey) {
     try {
-      const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: "claude", session: "doctor" });
+      const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: "claude", session: "doctor", trackHealth: false });
       const rows = res.status === 200 ? toProjectRows(res.json) : null;
       if (rows) {
         const hit = repoKey ? rows.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === repoKey) : void 0;
@@ -2064,6 +2100,7 @@ export {
   PROMPT_MARKS_MAX,
   PRUNE_AFTER_DAYS,
   STDIN_MAX_BYTES,
+  TOKEN_REFUSAL_NOTICE_THRESHOLD,
   VERSION,
   autoUpdateNotice,
   autoUpdateState,
@@ -2109,6 +2146,7 @@ export {
   prometheusPort,
   promptMarksFor,
   readConfig,
+  readTokenRefusalState,
   readTranscriptSessions,
   refusalLogPath,
   repoKeyFromRemote,
@@ -2117,6 +2155,7 @@ export {
   segmentRuns,
   shyreHome,
   staleNotice,
+  tokenRefusalNotice,
   tokensDoctorLine,
   uncoveredMillis,
   uncoveredSegments,

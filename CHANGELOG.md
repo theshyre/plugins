@@ -4,6 +4,26 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.7.0 — 2026-09-10
+
+- **The hook says so after repeated 401s (P-02).** A 401 stays a NON-final
+  refusal — a spooled run still has to survive a token rotation without
+  being deleted for it — but the runtime now counts consecutive 401 answers
+  from delivery in a small file beside the spool, reset on any 2xx. Once the
+  streak reaches three, session start prints how many times the token has
+  been refused, since when, and where to re-mint it (`/settings/integrations`)
+  — and that the spooled runs are kept and will post once a working key is
+  in place. `doctor` shows the same streak on its `token:` line. Nothing
+  about the server's uniform 401 body or the hook's request shape changed;
+  only what the runtime remembers about its own answers.
+- **The credentials banner covers agent access tokens too (P-02).** Before
+  this, `integration_tokens.expires_at` had zero readers outside the
+  function that refuses an expired token with the same 401 as a revoked one
+  — a PAT could go quiet with nothing in the app saying why. The dashboard
+  banner and `/system/credentials` now list the viewer's own live tokens
+  alongside Vercel, Resend, GitHub and Jira, labeled with the token's own
+  name and localized in both `en` and `es`.
+
 ## 1.6.1 — 2026-09-09
 
 - **The README caught up.** The repository's front page still described

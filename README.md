@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.6.1 (2026-09-09) — see `CHANGELOG.md`.
+**Latest release:** 1.7.0 (2026-09-10) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -36,6 +36,10 @@ exists.
   an archived project is kept back with the reason; a window an entry
   already covers is skipped; an entry that cannot be delivered waits, and is
   dropped only after the server has been told.
+- **A dead token says so.** A 401 never drops a spooled run — it survives a
+  token rotation — but after three refused deliveries in a row, session
+  start reports how many times and since when, and points at
+  `/settings/integrations` to re-mint it. `doctor` shows the same streak.
 - **The MCP server signs in through the browser.** The first Shyre tool a
   session uses opens a tab, you pick the team and click Allow, and the agent
   holds a token nobody typed — fifteen tools, from "start a timer" to "draft

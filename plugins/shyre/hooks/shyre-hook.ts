@@ -116,7 +116,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.6.1";
+export const VERSION = "1.7.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -896,9 +896,61 @@ interface HttpOptions {
   agent: string;
   session: string;
   body?: unknown;
+  /** False for a diagnostic probe (doctor) that must not move state a person
+   *  did not cause by running the agent: `deliver` and its helpers leave this
+   *  on, so the streak below reflects only real delivery attempts. */
+  trackHealth?: boolean;
 }
 
-async function http(method: "GET" | "POST", url: string, { apiKey, agent, session, body }: HttpOptions): Promise<HttpResult> {
+/** Where the streak of consecutive 401 answers lives — beside the spool, like
+ *  latest-version.json, never inside it, so a sweep of the spool directory
+ *  never mistakes it for an item. */
+function tokenRefusalStatePath(): string {
+  return join(shyreHome(), "token-refusals.json");
+}
+
+/** How many delivery attempts in a row the current token has been refused,
+ *  and when the streak began. Zero/empty when nothing has ever refused it,
+ *  or the last answer was a 2xx. */
+export interface TokenRefusalState {
+  count: number;
+  since: string;
+}
+
+export function readTokenRefusalState(): TokenRefusalState {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(tokenRefusalStatePath(), "utf8"));
+    if (isRecord(parsed) && typeof parsed.count === "number" && Number.isFinite(parsed.count) && parsed.count >= 0 && typeof parsed.since === "string") {
+      return { count: parsed.count, since: parsed.since };
+    }
+  } catch {
+    /* never refused, or unreadable: zero */
+  }
+  return { count: 0, since: "" };
+}
+
+/**
+ * A 401 extends the streak (401 stays a NON-final refusal in `isFinalRefusal`
+ * — a rotated token must not cost the spooled hours); any 2xx clears it. A
+ * 403, a 5xx, a redirect or no network at all say nothing about the token's
+ * own validity, so they leave the streak untouched rather than resetting a
+ * count a person is about to be told about. Best effort: a token-health file
+ * that cannot be written costs nothing but the eventual notice.
+ */
+function recordTokenAnswer(status: number): void {
+  try {
+    if (status === 401) {
+      const state = readTokenRefusalState();
+      writeAtomic(tokenRefusalStatePath(), JSON.stringify({ count: state.count + 1, since: state.count > 0 ? state.since : nowIso() }), 0o600);
+    } else if (status >= 200 && status < 300) {
+      if (readTokenRefusalState().count > 0) writeAtomic(tokenRefusalStatePath(), JSON.stringify({ count: 0, since: "" }), 0o600);
+    }
+  } catch {
+    /* see above */
+  }
+}
+
+async function http(method: "GET" | "POST", url: string, { apiKey, agent, session, body, trackHealth = true }: HttpOptions): Promise<HttpResult> {
   // A corporate proxy setup that disables certificate checks globally would
   // have the hook hand the token to whatever presents a certificate.
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && url.startsWith("https:")) {
@@ -930,6 +982,7 @@ async function http(method: "GET" | "POST", url: string, { apiKey, agent, sessio
     } catch {
       json = null;
     }
+    if (trackHealth) recordTokenAnswer(res.status);
     return { status: res.status, json, text };
   } catch (err) {
     return { status: 0, json: null, text: errorMessage(err) };
@@ -1011,7 +1064,7 @@ export function cmdStart(argvAgent: string, payload: unknown, announce = false):
   // Only on the real SessionStart — a beat that creates state lazily is a
   // different hook whose stdout is not a place for a sentence.
   const notices = announce
-    ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd())].filter((n): n is string => n !== null)
+    ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n): n is string => n !== null)
     : [];
   for (const notice of notices) {
     try {
@@ -1542,7 +1595,10 @@ async function resolveMapped(id: string, item: SpoolItem, cfg: Config, projectsC
 /** Statuses after which the same request would be refused again. */
 function isFinalRefusal(status: number): boolean {
   // 401 (a rotated or expired token), 408 and 429 are conditions that pass;
-  // 403 (period locked, scope), 400/404/409/422 and the rest are not.
+  // 403 (period locked, scope), 400/404/409/422 and the rest are not. A
+  // spooled run surviving a token rotation is the whole point — the person
+  // finds out from `tokenRefusalNotice` instead, after enough 401s in a row
+  // that it stops looking like one blip.
   return status >= 400 && status < 500 && ![401, 408, 429].includes(status);
 }
 
@@ -2082,6 +2138,27 @@ export function staleNotice(agent: Agent = "claude", env: Env = process.env, api
         ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.`
         : `Replace the runtime: ${download}.`;
   return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
+}
+
+/** Delivery attempts in a row the token must be refused before a session
+ *  start says so. Below this, a rotated key is still "the next sweep will
+ *  probably work" — saying so on the very first 401 would cry wolf over one
+ *  blip; a token that stays dead says so on every session start from here,
+ *  since the count (and how long it has been broken) keeps climbing. */
+export const TOKEN_REFUSAL_NOTICE_THRESHOLD = 3;
+
+/**
+ * The line a session start prints once the current token has been refused
+ * `TOKEN_REFUSAL_NOTICE_THRESHOLD` times in a row: where to re-mint it, and
+ * that nothing was lost while it was broken. 401 stays a NON-final refusal
+ * (`isFinalRefusal`) so a spooled run survives a token rotation instead of
+ * being deleted for it — this notice is the only thing that tells the person
+ * to go fix the token, since the server's uniform 401 body never says why.
+ */
+export function tokenRefusalNotice(): string | null {
+  const state = readTokenRefusalState();
+  if (state.count < TOKEN_REFUSAL_NOTICE_THRESHOLD) return null;
+  return `Shyre: the token has been refused ${state.count} times in a row since ${state.since} — re-mint it at /settings/integrations. The spooled runs are kept and will post once a working key is in place. Tell the person.`;
 }
 
 export async function cmdFlush(cfg: Config): Promise<void> {
@@ -2649,7 +2726,12 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
   };
   attempt("api", () => `api: ${cfg.apiUrl}${cfg.apiUrl === DEFAULT_API_URL ? "" : `   WARNING: not the default ${DEFAULT_API_URL} — set by SHYRE_API_URL or ~/.shyre/config.json; the token is sent here`}`);
   // Only the prefix and four characters: doctor output ends up in issues.
-  attempt("token", () => `token: ${cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}…)` : "MISSING — export SHYRE_API_KEY or write ~/.shyre/config.json"}`);
+  attempt("token", () => {
+    const base = cfg.apiKey ? `present (${cfg.apiKey.slice(0, 14)}…)` : "MISSING — export SHYRE_API_KEY or write ~/.shyre/config.json";
+    const refused = readTokenRefusalState();
+    if (refused.count === 0) return `token: ${base}`;
+    return `token: ${base} — refused ${refused.count} time${refused.count === 1 ? "" : "s"} since ${refused.since}; re-mint at /settings/integrations`;
+  });
   attempt("config file", () => {
     const configPath = join(shyreHome(), "config.json");
     const mode = modeOf(configPath);
@@ -2692,7 +2774,7 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
     lines.push(`server: not asked — the origin is not the default; run doctor --probe to send the token to ${cfg.apiUrl}`);
   } else if (cfg.apiKey) {
     try {
-      const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: "claude", session: "doctor" });
+      const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: "claude", session: "doctor", trackHealth: false });
       const rows = res.status === 200 ? toProjectRows(res.json) : null;
       if (rows) {
         const hit = repoKey ? rows.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === repoKey) : undefined;
