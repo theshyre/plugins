@@ -106,11 +106,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   different window than the one posted is treated as exactly that replay
  *   and the stretch is kept.
  *
+ * • Checkpoints (1.6.0): a run does not wait for SessionEnd. A beat that
+ *   arrives after a gap over the idle cap spools the run before it at once,
+ *   and a `stop` beat with more than `checkpoint_seconds` (default 1800) of
+ *   the OPEN run unposted spools that stretch, cut at the stop mark — the
+ *   cut mark stays as the remainder's first mark so the meters stay exact.
+ *   `0` turns both cuts off. A tail under a minute at session end is
+ *   dropped, as any run under a minute always was; the token meter then
+ *   rides the newest undelivered checkpoint instead.
+ *
  * • The tenth field: prompt_marks, the instants you sent a prompt inside the
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.5.0";
+var VERSION = "1.6.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -155,6 +164,7 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 var MAX_IDLE_CAP_SECONDS = 86400;
+var DEFAULT_CHECKPOINT_SECONDS = 1800;
 function shyreHome() {
   return process.env.SHYRE_HOME || join(homedir(), ".shyre");
 }
@@ -188,7 +198,16 @@ function readConfig(env = process.env) {
   const apiKey = env.SHYRE_API_KEY || fileKey;
   const apiUrl = validApiUrl(env.SHYRE_API_URL || fileUrl) || DEFAULT_API_URL;
   const cap = Number(env.SHYRE_IDLE_CAP_SECONDS || fileCap || 900);
-  return { apiKey, apiUrl, idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900 };
+  const fileCheckpoint = typeof file.checkpoint_seconds === "number" || typeof file.checkpoint_seconds === "string" ? file.checkpoint_seconds : void 0;
+  const rawCheckpoint = env.SHYRE_CHECKPOINT_SECONDS ?? fileCheckpoint;
+  const checkpoint2 = rawCheckpoint === void 0 || rawCheckpoint === "" ? DEFAULT_CHECKPOINT_SECONDS : Number(rawCheckpoint);
+  return {
+    apiKey,
+    apiUrl,
+    idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900,
+    // 0 is a real answer (off); anything unreadable or negative is the default.
+    checkpointSeconds: Number.isFinite(checkpoint2) && checkpoint2 >= 0 && checkpoint2 <= MAX_IDLE_CAP_SECONDS ? Math.floor(checkpoint2) : DEFAULT_CHECKPOINT_SECONDS
+  };
 }
 function repoKeyFromRemote(remote) {
   if (!remote) return null;
@@ -578,7 +597,7 @@ function detachedFlush() {
   } catch {
   }
 }
-function cmdStart(argvAgent, payload) {
+function cmdStart(argvAgent, payload, announce = false) {
   const agent = detectAgent(argvAgent, payload);
   const { session, cwd } = normalizePayload(payload);
   if (!session) {
@@ -598,9 +617,17 @@ function cmdStart(argvAgent, payload) {
   }
   appendFileSync(`${base}.marks`, `${nowIso()} start
 `, { mode: 384 });
+  const notices = announce ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd())].filter((n) => n !== null) : [];
+  for (const notice of notices) {
+    try {
+      process.stdout.write(`${notice}
+`);
+    } catch {
+    }
+  }
   detachedFlush();
 }
-function cmdBeat(argvAgent, payload, tag) {
+function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -610,8 +637,28 @@ function cmdBeat(argvAgent, payload, tag) {
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) cmdStart(agent, payload);
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
-  appendFileSync(`${base}.marks`, `${nowIso()} ${k}
+  const now = Date.now();
+  appendFileSync(`${base}.marks`, `${isoSeconds(now)} ${k}
 `, { mode: 384 });
+  try {
+    if (cfg.checkpointSeconds <= 0) return;
+    const marks = parseMarks(readFileSync(`${base}.marks`, "utf8")).sort((a, b) => a.t - b.t);
+    const prev = marks[marks.length - 2];
+    const latest = marks[marks.length - 1];
+    if (!prev || !latest || marks.length < 2) return;
+    let cutAt = null;
+    if (latest.t - prev.t > cfg.idleCapSeconds * 1e3) cutAt = prev.t;
+    else if (k === "stop") {
+      const first = openRunStart(marks, cfg.idleCapSeconds);
+      if (latest.t - first >= cfg.checkpointSeconds * 1e3) cutAt = latest.t;
+    }
+    if (cutAt === null) return;
+    const meta = readMeta(base, agent, session);
+    if (!meta) return;
+    if (checkpoint(agent, base, meta, cfg.idleCapSeconds, cutAt) > 0) detachedFlush();
+  } catch (err) {
+    noteOncePerMinute("checkpoint", `${agent}	checkpoint skipped: ${errorMessage(err)}`);
+  }
 }
 function coerceMeta(value, fallbackAgent, fallbackSession) {
   if (!isRecord(value)) return null;
@@ -624,6 +671,78 @@ function coerceMeta(value, fallbackAgent, fallbackSession) {
     cwd: typeof value.cwd === "string" ? value.cwd : "",
     repoKey: typeof value.repoKey === "string" ? value.repoKey : null
   };
+}
+function spoolRuns(agent, base, meta, runs) {
+  const out = [];
+  for (const run of runs) {
+    const item = {
+      agent: meta.agent,
+      label: meta.label,
+      session: meta.session,
+      cwd: meta.cwd,
+      repo_key: meta.repoKey,
+      start_time: run.start,
+      end_time: run.end,
+      agent_runtime_min: run.runtimeMin,
+      agent_wait_min: run.waitMin,
+      marks: run.marks,
+      idempotency_key: `${meta.session}:${run.start}`,
+      session_ref: meta.session,
+      created: nowIso()
+    };
+    const path = join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`);
+    writeAtomic(path, JSON.stringify(item), 384);
+    out.push({ path, item });
+  }
+  return out;
+}
+function checkpoint(agent, base, meta, capSeconds, cutAtMs) {
+  let marks;
+  try {
+    marks = parseMarks(readFileSync(`${base}.marks`, "utf8"));
+  } catch {
+    return 0;
+  }
+  const sorted = [...marks].sort((a, b) => a.t - b.t);
+  const cutMark = [...sorted].reverse().find((m) => m.t <= cutAtMs);
+  if (!cutMark) return 0;
+  const cut = cutMark.t;
+  const prefix = sorted.filter((m) => m.t <= cut);
+  const remainder = sorted.filter((m) => m.t >= cut);
+  const runs = segmentRuns(prefix, capSeconds);
+  try {
+    spoolRuns(agent, base, meta, runs);
+  } catch (err) {
+    logRefusal(`${basename(base)}	checkpoint could not spool ${runs.length} run(s) (${errorMessage(err)}); marks left in place`);
+    return 0;
+  }
+  try {
+    writeAtomic(`${base}.marks`, remainder.map((m) => `${isoSeconds(m.t)} ${m.k}
+`).join(""), 384);
+  } catch (err) {
+    logRefusal(`${basename(base)}	checkpoint spooled ${runs.length} run(s) but could not rewrite the marks (${errorMessage(err)}); they will be re-spooled under the same keys`);
+  }
+  return runs.length;
+}
+function openRunStart(marks, capSeconds) {
+  const sorted = [...marks].sort((a, b) => a.t - b.t);
+  const capMs = capSeconds * 1e3;
+  for (let i = sorted.length - 1; i > 0; i -= 1) {
+    const here = sorted[i];
+    const before = sorted[i - 1];
+    if (here && before && here.t - before.t > capMs) return here.t;
+  }
+  return sorted[0]?.t ?? Number.POSITIVE_INFINITY;
+}
+function readMeta(base, agent, session) {
+  try {
+    const parsed = JSON.parse(readFileSync(`${base}.meta.json`, "utf8"));
+    const meta = coerceMeta(parsed, agent, session);
+    if (meta && meta.repoKey === null && meta.cwd) meta.repoKey = repoKeyFromRemote(gitRemote(meta.cwd));
+    return meta;
+  } catch {
+    return null;
+  }
 }
 function prometheusPort(env) {
   const raw = (env.OTEL_EXPORTER_PROMETHEUS_PORT ?? "").trim();
@@ -740,31 +859,8 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
     marksText = "";
   }
   const runs = segmentRuns(parseMarks(marksText), idleCapSeconds);
-  let last;
-  for (const run of runs) {
-    const item = {
-      agent: meta.agent,
-      label: meta.label,
-      session,
-      cwd: meta.cwd,
-      repo_key: meta.repoKey,
-      start_time: run.start,
-      end_time: run.end,
-      agent_runtime_min: run.runtimeMin,
-      agent_wait_min: run.waitMin,
-      marks: run.marks,
-      // Keyed on the run's START INSTANT, not its ordinal: a session id is
-      // reused across /clear and --resume, so "run 1" would recur, and the
-      // server would answer the second with the FIRST entry as a replay —
-      // a 2xx that deleted the spool file and lost the hours silently.
-      idempotency_key: `${session}:${run.start}`,
-      session_ref: session,
-      created: nowIso()
-    };
-    const path = join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`);
-    writeAtomic(path, JSON.stringify(item), 384);
-    last = { path, item };
-  }
+  const spooled = spoolRuns(agent, base, meta, runs);
+  const last = spooled[spooled.length - 1];
   if (last) {
     let tokens;
     try {
@@ -773,6 +869,33 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
       tokens = void 0;
     }
     if (tokens) writeAtomic(last.path, JSON.stringify({ ...last.item, agent_tokens: tokens }), 384);
+  } else if (marksText.trim() !== "") {
+    const prefix = `${agent}-${basename(base)}-`;
+    let newest;
+    try {
+      newest = readdirSync(spoolDir()).filter((f) => f.startsWith(prefix) && f.endsWith(".json")).sort().pop();
+    } catch {
+      newest = void 0;
+    }
+    let tokens;
+    if (newest) {
+      try {
+        tokens = await scrape(session);
+      } catch {
+        tokens = void 0;
+      }
+    }
+    if (newest && tokens) {
+      try {
+        const path = join(spoolDir(), newest);
+        const prior = JSON.parse(readFileSync(path, "utf8"));
+        if (isRecord(prior)) writeAtomic(path, JSON.stringify({ ...prior, agent_tokens: tokens }), 384);
+      } catch (err) {
+        logRefusal(`${basename(base)}	session end: could not attach the token meter to ${newest}: ${errorMessage(err)}`);
+      }
+    } else if (!newest) {
+      logRefusal(`${basename(base)}	session end: the final stretch was under a minute and every checkpoint has already been delivered; the token meter for this session was not recorded`);
+    }
   }
   try {
     unlinkSync(`${base}.marks`);
@@ -789,13 +912,17 @@ function toProjectRows(value) {
   const rows = [];
   for (const entry of value) {
     if (!isRecord(entry) || typeof entry.id !== "string") continue;
-    rows.push({ id: entry.id, github_repo: typeof entry.github_repo === "string" ? entry.github_repo : null });
+    rows.push({
+      id: entry.id,
+      github_repo: typeof entry.github_repo === "string" ? entry.github_repo : null,
+      status: typeof entry.status === "string" ? entry.status : null
+    });
   }
   return rows;
 }
 async function resolveProject(item, cfg, projectsCache) {
   const fromMap = resolveFromMap(readMapFile(), item.repo_key);
-  if (fromMap) return { id: fromMap };
+  if (fromMap) return resolveMapped(fromMap, item, cfg, projectsCache);
   if (!item.repo_key) return { id: null, reason: "unmapped" };
   if (!projectsCache.list && !projectsCache.failed) {
     const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, {
@@ -814,7 +941,22 @@ async function resolveProject(item, cfg, projectsCache) {
     return { id: null, reason: "lookup-failed", status: failed === -2 ? -2 : failed > 0 ? failed : 0 };
   }
   const hit = list.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === item.repo_key);
-  return hit ? { id: hit.id } : { id: null, reason: "unmapped" };
+  if (!hit) return { id: null, reason: "unmapped" };
+  return closedProject(hit) ?? { id: hit.id, status: hit.status };
+}
+function closedProject(row) {
+  return row.status === "archived" ? { id: null, reason: "closed", status: row.status } : null;
+}
+async function resolveMapped(id, item, cfg, projectsCache) {
+  if (!projectsCache.list && !projectsCache.failed) {
+    const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+    if (res.status > 0) item.contacted = true;
+    const rows = res.status === 200 ? toProjectRows(res.json) : null;
+    if (rows && rows.length > 0) projectsCache.list = rows;
+    else projectsCache.failed = rows ? -2 : res.status || -1;
+  }
+  const row = projectsCache.list?.find((p) => p.id === id);
+  return (row && closedProject(row)) ?? { id, status: row?.status ?? null };
 }
 function isFinalRefusal(status) {
   return status >= 400 && status < 500 && ![401, 408, 429].includes(status);
@@ -878,10 +1020,17 @@ async function deliver(item, cfg, projectsCache = {}) {
       logRefusal(`${tag}	projects lookup failed (${why}), kept for retry`);
       return false;
     }
+    if (resolved.reason === "closed") {
+      logRefusal(`${tag}	the project this repo maps to is ${resolved.status}: nothing logged; point ~/.shyre/projects.json at the work in flight (kept for retry)`);
+      return false;
+    }
     logRefusal(`${tag}	unmapped: no map line and no project names this repo`);
     return true;
   }
   const projectId = resolved.id;
+  if (resolved.status === "completed") {
+    logRefusal(`${tag}	note: the project this repo maps to (${projectId}) is completed; posting anyway \u2014 if the work moved on, point ~/.shyre/projects.json at it`);
+  }
   const coverage = await fetchCoverage(item, cfg, tag);
   let segments = [[isoSeconds(ws), isoSeconds(we)]];
   if (coverage.complete) {
@@ -1044,8 +1193,118 @@ async function reportDrop(item, cfg, reason, keptDays) {
   }
   return { reported: false, contacted: res.status > 0, why: res.status ? String(res.status) : `no network: ${res.text.replace(/\s+/g, " ").slice(0, 120)}` };
 }
+function latestVersionPath() {
+  return join(shyreHome(), "latest-version.json");
+}
+function isNewerVersion(a, b) {
+  const pa = /^(\d+)\.(\d+)\.(\d+)$/.exec(a.trim());
+  const pb = /^(\d+)\.(\d+)\.(\d+)$/.exec(b.trim());
+  if (!pa || !pb) return false;
+  for (let i = 1; i <= 3; i += 1) {
+    const x = Number(pa[i]);
+    const y = Number(pb[i]);
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+async function probeLatestVersion(cfg, fetchImpl = fetch) {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4e3);
+    let text;
+    try {
+      const res = await fetchImpl(`${cfg.apiUrl}/hooks/VERSION`, { signal: ctl.signal, redirect: "manual", headers: { "User-Agent": `shyre-hook/${VERSION}` } });
+      if (res.status !== 200) return null;
+      text = (await res.text()).trim();
+    } finally {
+      clearTimeout(timer);
+    }
+    if (text.length > 32 || !/^\d+\.\d+\.\d+$/.test(text)) return null;
+    writeAtomic(latestVersionPath(), JSON.stringify({ version: text, checked: nowIso(), origin: cfg.apiUrl }), 384);
+    return text;
+  } catch {
+    return null;
+  }
+}
+function newestKnownVersion(env = process.env) {
+  let best = null;
+  const consider = (version, source) => {
+    if (typeof version !== "string" || version.length > 32 || !/^\d+\.\d+\.\d+$/.test(version.trim())) return;
+    if (!best || isNewerVersion(version, best.version)) best = { version: version.trim(), source };
+  };
+  try {
+    const parsed = JSON.parse(readFileSync(latestVersionPath(), "utf8"));
+    if (isRecord(parsed) && typeof parsed.version === "string") consider(parsed.version, "the server");
+  } catch {
+  }
+  try {
+    const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+    const manifest = join(configDir, "plugins", "marketplaces", "theshyre", "plugins", "shyre", ".claude-plugin", "plugin.json");
+    const parsed = JSON.parse(readFileSync(manifest, "utf8"));
+    if (isRecord(parsed) && typeof parsed.version === "string") consider(parsed.version, "the marketplace clone");
+  } catch {
+  }
+  return best;
+}
+function claudeConfigDir(env) {
+  return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+}
+function readJson(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function autoUpdateState(env = process.env, marketplace = "theshyre", cwd = process.cwd()) {
+  const dir = claudeConfigDir(env);
+  const known = readJson(join(dir, "plugins", "known_marketplaces.json"));
+  const entry = known && isRecord(known[marketplace]) ? known[marketplace] : null;
+  if (!entry) return { known: false };
+  if (entry.autoUpdate === true) return { known: true, on: true, source: "known_marketplaces.json" };
+  const settingsFiles = [
+    ["/Library/Application Support/ClaudeCode/managed-settings.json", "managed settings"],
+    ["/etc/claude-code/managed-settings.json", "managed settings"],
+    [join(cwd, ".claude", "settings.local.json"), "project local settings"],
+    [join(cwd, ".claude", "settings.json"), "project settings"],
+    [join(dir, "settings.json"), "user settings"]
+  ];
+  for (const [path, label] of settingsFiles) {
+    const settings = readJson(path);
+    const extra = settings && isRecord(settings.extraKnownMarketplaces) ? settings.extraKnownMarketplaces : null;
+    const mine = extra && isRecord(extra[marketplace]) ? extra[marketplace] : null;
+    if (mine && mine.autoUpdate === true) return { known: true, on: true, source: label };
+  }
+  return { known: true, on: false };
+}
+var AUTO_UPDATE_REMINDER_MS = 24 * 60 * 60 * 1e3;
+function autoUpdateNotice(agent, env = process.env, now = Date.now(), cwd = process.cwd()) {
+  if (agent !== "claude") return null;
+  const state = autoUpdateState(env, "theshyre", cwd);
+  if (!state.known || state.on) return null;
+  const stamp = join(shyreHome(), "auto-update-reminded");
+  try {
+    const last = Number(readFileSync(stamp, "utf8").trim());
+    if (Number.isFinite(last) && now - last < AUTO_UPDATE_REMINDER_MS) return null;
+  } catch {
+  }
+  try {
+    writeAtomic(stamp, String(now), 384);
+  } catch {
+  }
+  return "Auto-update is off for the theshyre marketplace, so this Shyre plugin only moves when someone updates it by hand. Turn it on once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update. Tell the person; this reminder comes at most once a day.";
+}
+function staleNotice(agent = "claude", env = process.env, apiUrl = DEFAULT_API_URL) {
+  const newest = newestKnownVersion(env);
+  if (!newest || !isNewerVersion(newest.version, VERSION)) return null;
+  const download = `curl -fsSL ${apiUrl}/hooks/shyre-hook.mjs -o ~/.shyre/bin/shyre-hook.mjs`;
+  const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins \u2014 or turn on auto-update once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update." : agent === "codex" || agent === "cursor" ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.` : `Replace the runtime: ${download}.`;
+  return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
+}
 async function cmdFlush(cfg) {
   const dir = spoolDir();
+  if (cfg.apiKey) await probeLatestVersion(cfg);
   const cache = {};
   const dayAgo = Date.now() - 86400 * 1e3;
   const weekAgo = Date.now() - 7 * 86400 * 1e3;
@@ -1476,6 +1735,17 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
     return `config file: ${mode & 63 ? `present \u2014 WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600"}`;
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
+  attempt("checkpoints", () => `checkpoints: ${cfg.checkpointSeconds > 0 ? `a stop after ${cfg.checkpointSeconds}s of unposted work posts it` : "off \u2014 every run waits for session end"}`);
+  attempt("auto-update", () => {
+    const state = autoUpdateState(process.env, "theshyre", cwd);
+    if (!state.known) return "auto-update: the theshyre marketplace is not known to Claude Code on this machine (a curl install, or no Claude Code)";
+    return state.on ? `auto-update: on for the theshyre marketplace (per ${state.source})` : "auto-update: OFF for the theshyre marketplace \u2014 /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update; until then releases arrive only by hand";
+  });
+  attempt("latest", () => {
+    const newest = newestKnownVersion();
+    if (!newest) return "latest: unknown \u2014 no sweep has asked the server yet, and no marketplace clone was found";
+    return isNewerVersion(newest.version, VERSION) ? `latest: ${newest.version} (per ${newest.source}) \u2014 this copy is ${VERSION}; run /plugin update shyre@theshyre, or enable auto-update for the theshyre marketplace` : `latest: this copy (${VERSION}) is the newest anything here knows of`;
+  });
   attempt("tls", () => process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 \u2014 the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on");
   attempt("tokens", () => tokensDoctorLine(process.env));
   const remote = gitRemote(cwd);
@@ -1750,8 +2020,8 @@ ${notes.map((n) => `  - ${n}`).join("\n")}
   }
   if (first === void 0 || !isAgent(first)) return;
   const payload = readStdin();
-  if (second === "start") return cmdStart(first, payload);
-  if (second === "beat") return cmdBeat(first, payload, third || "tool");
+  if (second === "start") return cmdStart(first, payload, true);
+  if (second === "beat") return cmdBeat(first, payload, third || "tool", cfg);
   if (second === "end") return cmdEnd(first, payload, cfg);
 }
 function invokedDirectly() {
@@ -1783,6 +2053,7 @@ export {
   COVERAGE_MAX_PAGES,
   COVERAGE_PAGE_SIZE,
   DEFAULT_API_URL,
+  DEFAULT_CHECKPOINT_SECONDS,
   DROP_GIVE_UP_ATTEMPTS,
   DROP_GIVE_UP_DAYS,
   DROP_REPORT_PATH,
@@ -1794,8 +2065,11 @@ export {
   PRUNE_AFTER_DAYS,
   STDIN_MAX_BYTES,
   VERSION,
+  autoUpdateNotice,
+  autoUpdateState,
   backfillOptions,
   buildEntryBody,
+  checkpoint,
   claudeShapedHooks,
   cmdBackfill,
   cmdBeat,
@@ -1816,18 +2090,22 @@ export {
   installCursor,
   installOrigin,
   isAgent,
+  isNewerVersion,
   labelSetClose,
   logRefusal,
   main,
   mapFileCandidates,
   marksFromTranscriptEvents,
   metersFor,
+  newestKnownVersion,
   nodeCommand,
   normalizePayload,
+  openRunStart,
   parseMarks,
   parseSessionTokens,
   pickTranscriptEvent,
   planBackfill,
+  probeLatestVersion,
   prometheusPort,
   promptMarksFor,
   readConfig,
@@ -1838,6 +2116,7 @@ export {
   scrapeSessionTokens,
   segmentRuns,
   shyreHome,
+  staleNotice,
   tokensDoctorLine,
   uncoveredMillis,
   uncoveredSegments,

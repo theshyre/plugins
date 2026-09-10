@@ -4,6 +4,47 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.6.0 — 2026-09-09
+
+- **Time shows up while you work.** Before this, every run waited for
+  session end: a session busy from morning to evening wrote nothing to Shyre
+  all day, and a session left open overnight wrote nothing at all. Now a
+  `stop` beat — the agent finished its turn — with more than
+  `checkpoint_seconds` (default 1800, half an hour) of unposted work posts
+  that stretch as its own entry, cut at that mark, and a beat that arrives
+  after a gap over the idle cap posts the run before it at once. Session end
+  is unchanged: it posts whatever the marks file still holds. A long session
+  becomes several entries instead of one; each has its true window and both
+  meters, and the stand-down still works by the minute against your own
+  entries — so an entry you log yourself for a unit of work may be answered
+  with a 409: retry once with the earliest free start it names, or, when it
+  says the window is already covered, leave it (the checkpoint has it). The
+  half-hour is measured on the OPEN run, so the first stop after a break is
+  not a cut. A tail under a minute at session end is dropped, as any run
+  under a minute always was; the token meter then rides the newest
+  undelivered checkpoint. `SHYRE_CHECKPOINT_SECONDS=0` or
+  `"checkpoint_seconds": 0` in `~/.shyre/config.json` turns both cuts off.
+- **The plugin says when it is stale.** Auto-update is off by default for
+  every third-party marketplace, and nothing a marketplace ships can turn it
+  on, so a plugin that was installed by hand sat at 1.0.2 while five
+  releases went by. Each sweep now asks the server which runtime it serves
+  (`GET /hooks/VERSION`, no token) and remembers the answer; the next session
+  start compares it — and the marketplace clone's manifest — to the running
+  copy, and when either is newer prints one line into the agent's context
+  naming the version and the two ways forward: `/plugin update shyre@theshyre`
+  now, or `/plugin → Marketplaces → theshyre → Enable auto-update` once.
+  A Codex or Cursor install is told the `curl` re-install instead. And the
+  plugin now checks whether auto-update is ON for the theshyre marketplace
+  on this machine — the `/plugin` toggle's entry in `known_marketplaces.json`,
+  then managed, project and user settings — and when it is off, a session start says
+  so and how to turn it on, at most once a day. `doctor` prints
+  `auto-update:`, `latest:` and `checkpoints:` lines.
+- **A run mapped to an archived project is kept, not posted**, with the
+  reason in the log, until the map or the project changes; a run mapped to a
+  completed project is posted (a delivered fixed-bid gets warranty sessions)
+  and the log says so each time, because the map file's own note warns about
+  a repo still pointed at a deliverable that finished while the work moved
+  on. The projects list now carries each project's status for this.
 ## 1.5.0 — 2026-09-08
 
 - **The MCP server signs in.** `.mcp.json` no longer sends a bearer token:

@@ -5,10 +5,15 @@ description: Log the time you just spent to Shyre when you finish a substantial 
 
 # Log your own time to Shyre
 
-The session hooks record every session as a backstop. This skill is the
-intent layer: when you finish a unit of work, write the entry yourself, with a
-real description and the right category. The hook stands down for the minutes
-your entries already cover, on any project, so nothing is counted twice.
+The session hooks record every session as a backstop — in checkpoints
+along the way (a stretch of half an hour or more posts when your turn ends),
+not only at session end. This skill is the intent layer: when you finish a
+unit of work, write the entry yourself, with a real description and the right
+category. The hook stands down for the minutes your entries already cover, on
+any project, so nothing is counted twice; and where a checkpoint already
+covers some of the minutes you are about to log, the server answers your
+post with a 409 — retry once with the earliest free start it names, or, if
+it says the window is already covered, do not re-log it.
 
 **Local override:** if the repo's own `CLAUDE.md` or `AGENTS.md` defines its
 own time-logging convention, follow that instead.
@@ -43,8 +48,11 @@ completed, a review delivered. Not after every small edit.
    - `idempotency_key` — unique per unit, e.g. `<branch>:<short-slug>`.
      Never the bare branch: two units on one branch would collapse into one.
    - Do **not** set `billable`; the server decides.
-3. **On a 409**, read the message: it names the blocking window and the
-   earliest free start. Retry once with that start. Do not probe.
+3. **On a 409**, read the message. If it names the blocking window and an
+   earliest free start, retry once with that start. If it says the window
+   is **already covered**, the hook's checkpoint has logged those minutes:
+   do not re-log them and do not probe — say so and move on. A running timer
+   named in the message is the person's; leave it.
 
 ## Parallel sessions
 

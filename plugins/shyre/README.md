@@ -10,6 +10,13 @@ claude plugin marketplace add theshyre/plugins
 claude plugin install shyre@theshyre
 ```
 
+Then turn on auto-update for the marketplace once — `/plugin` → **Marketplaces**
+→ **theshyre** → **Enable auto-update** — so releases land on the next
+launch. Claude Code leaves auto-update off for every marketplace that is
+not Anthropic's, and nothing a plugin ships can change that; until you flip
+it, the plugin tells the agent at session start that it is off (once a day)
+and when a newer version exists.
+
 The MCP tools sign in on first use: Claude Code opens a browser tab (`/mcp`
 → Authenticate), you pick the team and click **Allow**, and the agent holds
 a token nobody typed. For the session hooks — which have no browser — export
@@ -20,8 +27,11 @@ What ships:
 
 - `hooks/hooks.json` — SessionStart, UserPromptSubmit, PostToolUse,
   SubagentStop, Stop and SessionEnd all run `hooks/shyre-hook.mjs`, the Node
-  runtime that records activity marks and, at session end, spools one time
-  entry per run of activity. It is built from `hooks/shyre-hook.ts`, the
+  runtime that records activity marks and spools one time entry per run of
+  activity — at session end, and along the way: a run that ends at an idle
+  gap posts at once, and an open run with more than half an hour unposted
+  posts a checkpoint entry when the agent's turn ends, so a day's work is in
+  Shyre while it happens. It is built from `hooks/shyre-hook.ts`, the
   TypeScript source shipped beside it; the artifact is one plain JavaScript
   file with no dependencies, because a hook runs as a bare `node` command.
 - `.mcp.json` — the Shyre MCP server. No key in it: the agent signs in

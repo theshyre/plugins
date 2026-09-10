@@ -84,6 +84,15 @@
  *   different window than the one posted is treated as exactly that replay
  *   and the stretch is kept.
  *
+ * • Checkpoints (1.6.0): a run does not wait for SessionEnd. A beat that
+ *   arrives after a gap over the idle cap spools the run before it at once,
+ *   and a `stop` beat with more than `checkpoint_seconds` (default 1800) of
+ *   the OPEN run unposted spools that stretch, cut at the stop mark — the
+ *   cut mark stays as the remainder's first mark so the meters stay exact.
+ *   `0` turns both cuts off. A tail under a minute at session end is
+ *   dropped, as any run under a minute always was; the token meter then
+ *   rides the newest undelivered checkpoint instead.
+ *
  * • The tenth field: prompt_marks, the instants you sent a prompt inside the
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
@@ -107,7 +116,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.5.0";
+export const VERSION = "1.6.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -193,6 +202,10 @@ export interface Config {
   apiKey: string;
   apiUrl: string;
   idleCapSeconds: number;
+  /** How much of an open run may sit unposted before a `stop` beat posts it
+   *  as a checkpoint entry (1.6.0). 0 turns checkpoints off: everything
+   *  waits for session end, as before. */
+  checkpointSeconds: number;
 }
 
 /** One queued run, as written to ~/.shyre/spool. */
@@ -305,6 +318,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** A day: no run may be longer than the server's per-entry maximum anyway. */
 export const MAX_IDLE_CAP_SECONDS = 86_400;
+/** Half an hour: long enough that a checkpoint is a real stretch of work,
+ *  short enough that a day's work is visible in Shyre while it is happening. */
+export const DEFAULT_CHECKPOINT_SECONDS = 1800;
 
 export function shyreHome(): string {
   return process.env.SHYRE_HOME || join(homedir(), ".shyre");
@@ -354,9 +370,18 @@ export function readConfig(env: Env = process.env): Config {
   const apiKey = env.SHYRE_API_KEY || fileKey;
   const apiUrl = validApiUrl(env.SHYRE_API_URL || fileUrl) || DEFAULT_API_URL;
   const cap = Number(env.SHYRE_IDLE_CAP_SECONDS || fileCap || 900);
+  const fileCheckpoint = typeof file.checkpoint_seconds === "number" || typeof file.checkpoint_seconds === "string" ? file.checkpoint_seconds : undefined;
+  const rawCheckpoint = env.SHYRE_CHECKPOINT_SECONDS ?? fileCheckpoint;
+  const checkpoint = rawCheckpoint === undefined || rawCheckpoint === "" ? DEFAULT_CHECKPOINT_SECONDS : Number(rawCheckpoint);
   // Bounded above as well as below: a cap of 1e9 would turn elapsed span
   // into "active time", which is the one thing the meter must never do.
-  return { apiKey, apiUrl, idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900 };
+  return {
+    apiKey,
+    apiUrl,
+    idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900,
+    // 0 is a real answer (off); anything unreadable or negative is the default.
+    checkpointSeconds: Number.isFinite(checkpoint) && checkpoint >= 0 && checkpoint <= MAX_IDLE_CAP_SECONDS ? Math.floor(checkpoint) : DEFAULT_CHECKPOINT_SECONDS,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +987,7 @@ function detachedFlush(): void {
 }
 
 /** SessionStart. Appends when state already exists — compaction, resume. */
-export function cmdStart(argvAgent: string, payload: unknown): void {
+export function cmdStart(argvAgent: string, payload: unknown, announce = false): void {
   const agent = detectAgent(argvAgent, payload);
   const { session, cwd } = normalizePayload(payload);
   if (!session) {
@@ -981,11 +1006,35 @@ export function cmdStart(argvAgent: string, payload: unknown): void {
     writeAtomic(`${base}.meta.json`, JSON.stringify(meta), 0o600);
   }
   appendFileSync(`${base}.marks`, `${nowIso()} start\n`, { mode: 0o600 });
+  // SessionStart stdout is added to the agent's context; this is how the
+  // person finds out a newer runtime exists without watching a marketplace.
+  // Only on the real SessionStart — a beat that creates state lazily is a
+  // different hook whose stdout is not a place for a sentence.
+  const notices = announce
+    ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd())].filter((n): n is string => n !== null)
+    : [];
+  for (const notice of notices) {
+    try {
+      process.stdout.write(`${notice}\n`);
+    } catch {
+      /* a closed pipe must not fail the session */
+    }
+  }
   detachedFlush();
 }
 
-/** A beat. Creates state on the fly when SessionStart never fired. */
-export function cmdBeat(argvAgent: string, payload: unknown, tag: string): void {
+/**
+ * A beat. Creates state on the fly when SessionStart never fired.
+ *
+ * Then the two checkpoint questions (1.6.0), in this order:
+ *   1. Did this beat arrive after a gap over the idle cap? Then the run
+ *      before it is complete and is posted now, not at session end.
+ *   2. Is this a `stop` — the agent's turn is over — and has the open run
+ *      more than `checkpointSeconds` unposted? Then that stretch is posted
+ *      now, cut at this mark.
+ * Either spools and kicks a detached flush; the hook itself does no network.
+ */
+export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: Pick<Config, "idleCapSeconds" | "checkpointSeconds"> = readConfig()): void {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -995,7 +1044,34 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string): void 
   const base = stateBase(agent, session);
   if (!existsSync(`${base}.meta.json`)) cmdStart(agent, payload);
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
-  appendFileSync(`${base}.marks`, `${nowIso()} ${k}\n`, { mode: 0o600 });
+  const now = Date.now();
+  appendFileSync(`${base}.marks`, `${isoSeconds(now)} ${k}\n`, { mode: 0o600 });
+  try {
+    // 0 is the whole escape hatch: no cut of any kind, every run waits for
+    // session end, exactly as before 1.6.0.
+    if (cfg.checkpointSeconds <= 0) return;
+    const marks = parseMarks(readFileSync(`${base}.marks`, "utf8")).sort((a, b) => a.t - b.t);
+    const prev = marks[marks.length - 2];
+    const latest = marks[marks.length - 1];
+    if (!prev || !latest || marks.length < 2) return;
+    let cutAt: number | null = null;
+    if (latest.t - prev.t > cfg.idleCapSeconds * 1000) cutAt = prev.t;
+    else if (k === "stop") {
+      // Measured from the first mark of the OPEN run, not of the file: after
+      // an idle cut the file still begins with the stale pre-gap mark, and
+      // measuring from it would checkpoint the first stop after every break
+      // — and drop a stretch under a minute that would have survived as
+      // part of a longer run at session end.
+      const first = openRunStart(marks, cfg.idleCapSeconds);
+      if (latest.t - first >= cfg.checkpointSeconds * 1000) cutAt = latest.t;
+    }
+    if (cutAt === null) return;
+    const meta = readMeta(base, agent, session);
+    if (!meta) return;
+    if (checkpoint(agent, base, meta, cfg.idleCapSeconds, cutAt) > 0) detachedFlush();
+  } catch (err) {
+    noteOncePerMinute("checkpoint", `${agent}\tcheckpoint skipped: ${errorMessage(err)}`);
+  }
 }
 
 /**
@@ -1016,6 +1092,120 @@ function coerceMeta(value: unknown, fallbackAgent: Agent, fallbackSession: strin
     cwd: typeof value.cwd === "string" ? value.cwd : "",
     repoKey: typeof value.repoKey === "string" ? value.repoKey : null,
   };
+}
+
+/** Write one spool item per run. Keyed on the run's START INSTANT, not its
+ *  ordinal: a session id is reused across /clear and --resume, so "run 1"
+ *  would recur, and the server would answer the second with the FIRST entry
+ *  as a replay — a 2xx that deleted the spool file and lost the hours. */
+function spoolRuns(agent: string, base: string, meta: Meta, runs: readonly Run[]): Array<{ path: string; item: SpoolItem }> {
+  const out: Array<{ path: string; item: SpoolItem }> = [];
+  for (const run of runs) {
+    const item: SpoolItem = {
+      agent: meta.agent,
+      label: meta.label,
+      session: meta.session,
+      cwd: meta.cwd,
+      repo_key: meta.repoKey,
+      start_time: run.start,
+      end_time: run.end,
+      agent_runtime_min: run.runtimeMin,
+      agent_wait_min: run.waitMin,
+      marks: run.marks,
+      idempotency_key: `${meta.session}:${run.start}`,
+      session_ref: meta.session,
+      created: nowIso(),
+    };
+    const path = join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`);
+    writeAtomic(path, JSON.stringify(item), 0o600);
+    out.push({ path, item });
+  }
+  return out;
+}
+
+/**
+ * Cut the marks file at an instant: everything up to and including the cut
+ * mark is segmented into runs and spooled NOW; the file is rewritten to
+ * start AT the cut mark. The cut mark is on both sides on purpose — the
+ * prefix run ends at it, and the remainder's first gap is measured from it,
+ * so the meters stay exact and nothing is bridged. A prefix run under a
+ * minute is dropped, as at session end.
+ *
+ * This is the whole checkpoint mechanism (1.6.0). Before it, every run
+ * waited for SessionEnd, and a session that stayed busy from morning to
+ * evening wrote nothing to Shyre all day. Two callers: a beat that arrives
+ * after a gap over the idle cap (the run before it is complete — cut at its
+ * last mark), and a `stop` beat when the open run has more than
+ * `checkpointSeconds` unposted (cut at the stop mark itself, so the wait
+ * that follows lands on the next stretch). SessionEnd is unchanged: it
+ * segments whatever the file still holds.
+ *
+ * Returns how many runs were spooled. Never throws.
+ */
+export function checkpoint(agent: string, base: string, meta: Meta, capSeconds: number, cutAtMs: number): number {
+  let marks: Mark[];
+  try {
+    marks = parseMarks(readFileSync(`${base}.marks`, "utf8"));
+  } catch {
+    return 0;
+  }
+  const sorted = [...marks].sort((a, b) => a.t - b.t);
+  // The cut is always a mark's own instant: marks are stored to the second,
+  // so an instant with milliseconds in it would put the cut mark on one
+  // side only. Snap to the last mark at or before the requested instant.
+  const cutMark = [...sorted].reverse().find((m) => m.t <= cutAtMs);
+  if (!cutMark) return 0;
+  const cut = cutMark.t;
+  const prefix = sorted.filter((m) => m.t <= cut);
+  const remainder = sorted.filter((m) => m.t >= cut);
+  const runs = segmentRuns(prefix, capSeconds);
+  try {
+    spoolRuns(agent, base, meta, runs);
+  } catch (err) {
+    // Nothing was cut: the marks are untouched, and the next beat tries
+    // again. Said, so a full disk is not a silent day.
+    logRefusal(`${basename(base)}\tcheckpoint could not spool ${runs.length} run(s) (${errorMessage(err)}); marks left in place`);
+    return 0;
+  }
+  // The spool is on disk before the marks go: a crash between the two
+  // re-spools the same runs under the same keys, which the server answers as
+  // replays, rather than losing them. A rewrite that fails is said, not
+  // hidden: the next cut re-spools the same starts with longer windows, and
+  // the coverage check trims them to what did not land.
+  try {
+    writeAtomic(`${base}.marks`, remainder.map((m) => `${isoSeconds(m.t)} ${m.k}\n`).join(""), 0o600);
+  } catch (err) {
+    logRefusal(`${basename(base)}\tcheckpoint spooled ${runs.length} run(s) but could not rewrite the marks (${errorMessage(err)}); they will be re-spooled under the same keys`);
+  }
+  return runs.length;
+}
+
+/** The instant the open run began: the latest mark whose gap from its
+ *  predecessor exceeds the idle cap, or the first mark. */
+export function openRunStart(marks: readonly Mark[], capSeconds: number): number {
+  const sorted = [...marks].sort((a, b) => a.t - b.t);
+  const capMs = capSeconds * 1000;
+  for (let i = sorted.length - 1; i > 0; i -= 1) {
+    const here = sorted[i];
+    const before = sorted[i - 1];
+    if (here && before && here.t - before.t > capMs) return here.t;
+  }
+  // No marks: no open run, and nothing to measure a checkpoint from. An
+  // instant in the future fails CLOSED (the age comes out negative) rather
+  // than the epoch, which would make any stop a cut.
+  return sorted[0]?.t ?? Number.POSITIVE_INFINITY;
+}
+
+/** Read the session header the way `cmdEnd` does; null when unreadable. */
+function readMeta(base: string, agent: Agent, session: string): Meta | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(`${base}.meta.json`, "utf8"));
+    const meta = coerceMeta(parsed, agent, session);
+    if (meta && meta.repoKey === null && meta.cwd) meta.repoKey = repoKeyFromRemote(gitRemote(meta.cwd));
+    return meta;
+  } catch {
+    return null;
+  }
 }
 
 /** SessionEnd. Spools one item per run; no network. A second source firing
@@ -1147,7 +1337,7 @@ function total(c: { input: number; output: number; cache_read: number; cache_cre
   return c.input + c.output + c.cache_read + c.cache_creation;
 }
 
-export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: Pick<Config, "idleCapSeconds">, scrape: (session: string) => Promise<AgentTokens | undefined> = scrapeSessionTokens): Promise<void> {
+export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSeconds }: Pick<Config, "idleCapSeconds"> & Partial<Pick<Config, "checkpointSeconds">>, scrape: (session: string) => Promise<AgentTokens | undefined> = scrapeSessionTokens): Promise<void> {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -1181,35 +1371,17 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
   const runs = segmentRuns(parseMarks(marksText), idleCapSeconds);
   // The third meter, read while the agent's process is still alive and its
   // exporter still bound. Attached to the last run only — see SpoolItem.
-  let last: { path: string; item: SpoolItem } | undefined;
-  for (const run of runs) {
-    const item: SpoolItem = {
-      agent: meta.agent,
-      label: meta.label,
-      session,
-      cwd: meta.cwd,
-      repo_key: meta.repoKey,
-      start_time: run.start,
-      end_time: run.end,
-      agent_runtime_min: run.runtimeMin,
-      agent_wait_min: run.waitMin,
-      marks: run.marks,
-      // Keyed on the run's START INSTANT, not its ordinal: a session id is
-      // reused across /clear and --resume, so "run 1" would recur, and the
-      // server would answer the second with the FIRST entry as a replay —
-      // a 2xx that deleted the spool file and lost the hours silently.
-      idempotency_key: `${session}:${run.start}`,
-      session_ref: session,
-      created: nowIso(),
-    };
-    const path = join(spoolDir(), `${agent}-${basename(base)}-${run.start.replace(/[^0-9TZ]/g, "")}.json`);
-    writeAtomic(path, JSON.stringify(item), 0o600);
-    last = { path, item };
-  }
+  const spooled = spoolRuns(agent, base, meta, runs);
+  const last = spooled[spooled.length - 1];
   // ⚠️ SPOOL FIRST, SCRAPE SECOND. The hours are on disk before anything
   // waits on a socket: a SessionEnd killed inside the half-second scrape
   // (terminal closed, hook timeout) loses the tokens, never the run. The
-  // third meter rides the LAST run only — see SpoolItem.agent_tokens.
+  // third meter rides the LAST run only — see SpoolItem.agent_tokens. With
+  // checkpoints (1.6.0) that is the last STRETCH the end spools; when a
+  // final stretch under a minute spools nothing, the counters ride the
+  // newest checkpoint of this session still UNDELIVERED on disk (a
+  // delivered one is gone, and the server would not take a second post),
+  // and are said to be lost only when there is none.
   if (last) {
     let tokens: AgentTokens | undefined;
     try {
@@ -1218,6 +1390,38 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
       tokens = undefined;
     }
     if (tokens) writeAtomic(last.path, JSON.stringify({ ...last.item, agent_tokens: tokens }), 0o600);
+  } else if (marksText.trim() !== "") {
+    // The end spooled nothing (a tail under a minute after a checkpoint):
+    // the counters ride the newest undelivered checkpoint of this session
+    // if one is still on disk, and are said to be lost otherwise.
+    const prefix = `${agent}-${basename(base)}-`;
+    let newest: string | undefined;
+    try {
+      newest = readdirSync(spoolDir()).filter((f) => f.startsWith(prefix) && f.endsWith(".json")).sort().pop();
+    } catch {
+      newest = undefined;
+    }
+    // No undelivered checkpoint: nothing to attach to, so the half-second
+    // scrape is not spent inside the SessionEnd budget.
+    let tokens: AgentTokens | undefined;
+    if (newest) {
+      try {
+        tokens = await scrape(session);
+      } catch {
+        tokens = undefined;
+      }
+    }
+    if (newest && tokens) {
+      try {
+        const path = join(spoolDir(), newest);
+        const prior: unknown = JSON.parse(readFileSync(path, "utf8"));
+        if (isRecord(prior)) writeAtomic(path, JSON.stringify({ ...prior, agent_tokens: tokens }), 0o600);
+      } catch (err) {
+        logRefusal(`${basename(base)}\tsession end: could not attach the token meter to ${newest}: ${errorMessage(err)}`);
+      }
+    } else if (!newest) {
+      logRefusal(`${basename(base)}\tsession end: the final stretch was under a minute and every checkpoint has already been delivered; the token meter for this session was not recorded`);
+    }
   }
   try {
     unlinkSync(`${base}.marks`);
@@ -1235,6 +1439,8 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
 interface ProjectRow {
   id: string;
   github_repo: string | null;
+  /** `active`, `paused`, `completed`, `archived`; null when the server did not say. */
+  status: string | null;
 }
 
 /** Shared across one sweep: one projects lookup per flush, not per item. */
@@ -1243,7 +1449,12 @@ export interface ProjectsCache {
   failed?: number;
 }
 
-type Resolved = { id: string } | { id: null; reason: "unmapped" } | { id: null; reason: "lookup-failed"; status: number };
+type Resolved =
+  | { id: string; status?: string | null }
+  | { id: null; reason: "unmapped" }
+  | { id: null; reason: "lookup-failed"; status: number }
+  /** The project the run resolves to is completed or archived. */
+  | { id: null; reason: "closed"; status: string };
 /** `failed` codes that are not HTTP statuses: -1 no network, -2 an empty list. */
 
 function toProjectRows(value: unknown): ProjectRow[] | null {
@@ -1251,7 +1462,11 @@ function toProjectRows(value: unknown): ProjectRow[] | null {
   const rows: ProjectRow[] = [];
   for (const entry of value) {
     if (!isRecord(entry) || typeof entry.id !== "string") continue;
-    rows.push({ id: entry.id, github_repo: typeof entry.github_repo === "string" ? entry.github_repo : null });
+    rows.push({
+      id: entry.id,
+      github_repo: typeof entry.github_repo === "string" ? entry.github_repo : null,
+      status: typeof entry.status === "string" ? entry.status : null,
+    });
   }
   return rows;
 }
@@ -1268,7 +1483,7 @@ function toProjectRows(value: unknown): ProjectRow[] | null {
  */
 async function resolveProject(item: SpoolItem, cfg: Config, projectsCache: ProjectsCache): Promise<Resolved> {
   const fromMap = resolveFromMap(readMapFile(), item.repo_key);
-  if (fromMap) return { id: fromMap };
+  if (fromMap) return resolveMapped(fromMap, item, cfg, projectsCache);
   if (!item.repo_key) return { id: null, reason: "unmapped" };
   if (!projectsCache.list && !projectsCache.failed) {
     const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, {
@@ -1292,7 +1507,36 @@ async function resolveProject(item: SpoolItem, cfg: Config, projectsCache: Proje
     return { id: null, reason: "lookup-failed", status: failed === -2 ? -2 : failed > 0 ? failed : 0 };
   }
   const hit = list.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === item.repo_key);
-  return hit ? { id: hit.id } : { id: null, reason: "unmapped" };
+  if (!hit) return { id: null, reason: "unmapped" };
+  return closedProject(hit) ?? { id: hit.id, status: hit.status };
+}
+
+/**
+ * An ARCHIVED project is not a place for new hours: the run is kept, with
+ * the reason in the log, until the map (or the project) says otherwise. A
+ * COMPLETED one still is — a fixed-bid deliverable gets warranty sessions
+ * after it closes — but the delivery log says so each time, because the map
+ * file's own note warns about exactly this: a repo still pointed at a
+ * deliverable that finished last month, while the work moved to another.
+ */
+function closedProject(row: ProjectRow): Resolved | null {
+  return row.status === "archived" ? { id: null, reason: "closed", status: row.status } : null;
+}
+
+/** The map's answer, checked against the server's status when the list is
+ *  in hand. A map line that names a closed project is the mistake the
+ *  refusal above exists for; a list that could not be fetched leaves the map
+ *  trusted, so an outage never stalls a mapped run. */
+async function resolveMapped(id: string, item: SpoolItem, cfg: Config, projectsCache: ProjectsCache): Promise<Resolved> {
+  if (!projectsCache.list && !projectsCache.failed) {
+    const res = await http("GET", `${cfg.apiUrl}/api/v1/projects?status=all`, { apiKey: cfg.apiKey, agent: item.agent, session: item.session });
+    if (res.status > 0) item.contacted = true;
+    const rows = res.status === 200 ? toProjectRows(res.json) : null;
+    if (rows && rows.length > 0) projectsCache.list = rows;
+    else projectsCache.failed = rows ? -2 : res.status || -1;
+  }
+  const row = projectsCache.list?.find((p) => p.id === id);
+  return (row && closedProject(row)) ?? { id, status: row?.status ?? null };
 }
 
 /** Statuses after which the same request would be refused again. */
@@ -1398,10 +1642,17 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
       logRefusal(`${tag}\tprojects lookup failed (${why}), kept for retry`);
       return false;
     }
+    if (resolved.reason === "closed") {
+      logRefusal(`${tag}\tthe project this repo maps to is ${resolved.status}: nothing logged; point ~/.shyre/projects.json at the work in flight (kept for retry)`);
+      return false;
+    }
     logRefusal(`${tag}\tunmapped: no map line and no project names this repo`);
     return true;
   }
   const projectId = resolved.id;
+  if (resolved.status === "completed") {
+    logRefusal(`${tag}\tnote: the project this repo maps to (${projectId}) is completed; posting anyway — if the work moved on, point ~/.shyre/projects.json at it`);
+  }
   // ALL of your projects, not this one: the run that was written down twice
   // was a hook entry on the child project under the agent's own entries on
   // the parent, and a per-project check could not see them.
@@ -1652,8 +1903,194 @@ async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, kept
 }
 
 /** Sweep the spool, then the leftovers. Runs detached; never prints. */
+/** Where the flush leaves the newest runtime version the server named. */
+function latestVersionPath(): string {
+  return join(shyreHome(), "latest-version.json");
+}
+
+/** `a` is a newer semver than `b`. Non-semver on either side: false. */
+export function isNewerVersion(a: string, b: string): boolean {
+  const pa = /^(\d+)\.(\d+)\.(\d+)$/.exec(a.trim());
+  const pb = /^(\d+)\.(\d+)\.(\d+)$/.exec(b.trim());
+  if (!pa || !pb) return false;
+  for (let i = 1; i <= 3; i += 1) {
+    const x = Number(pa[i]);
+    const y = Number(pb[i]);
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+/**
+ * Ask the server which runtime it serves, and remember the answer for the
+ * next session start. ⚠️ NO TOKEN: the file is public, the request carries
+ * no headers, and it goes wherever `apiUrl` points — which is fine for the
+ * same reason. Best effort; never throws, never blocks a sweep for long.
+ */
+export async function probeLatestVersion(cfg: Pick<Config, "apiUrl">, fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 4000);
+    let text: string;
+    try {
+      const res = await fetchImpl(`${cfg.apiUrl}/hooks/VERSION`, { signal: ctl.signal, redirect: "manual", headers: { "User-Agent": `shyre-hook/${VERSION}` } });
+      if (res.status !== 200) return null;
+      text = (await res.text()).trim();
+    } finally {
+      clearTimeout(timer);
+    }
+    // One short line, or nothing: a body that is not a version is not read
+    // any further, and a version is never longer than this.
+    if (text.length > 32 || !/^\d+\.\d+\.\d+$/.test(text)) return null;
+    writeAtomic(latestVersionPath(), JSON.stringify({ version: text, checked: nowIso(), origin: cfg.apiUrl }), 0o600);
+    return text;
+  } catch {
+    return null;
+  }
+}
+
+/** The newest version anything on this machine knows of: the server's
+ *  answer from the last sweep, and the marketplace clone's manifest (which
+ *  is what auto-update reads). Null when neither can be read. */
+export function newestKnownVersion(env: Env = process.env): { version: string; source: string } | null {
+  let best: { version: string; source: string } | null = null;
+  const consider = (version: string | null | undefined, source: string): void => {
+    if (typeof version !== "string" || version.length > 32 || !/^\d+\.\d+\.\d+$/.test(version.trim())) return;
+    if (!best || isNewerVersion(version, best.version)) best = { version: version.trim(), source };
+  };
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(latestVersionPath(), "utf8"));
+    if (isRecord(parsed) && typeof parsed.version === "string") consider(parsed.version, "the server");
+  } catch {
+    /* never probed, or unreadable */
+  }
+  try {
+    const configDir = env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+    const manifest = join(configDir, "plugins", "marketplaces", "theshyre", "plugins", "shyre", ".claude-plugin", "plugin.json");
+    const parsed: unknown = JSON.parse(readFileSync(manifest, "utf8"));
+    if (isRecord(parsed) && typeof parsed.version === "string") consider(parsed.version, "the marketplace clone");
+  } catch {
+    /* no clone, or not a Claude Code install */
+  }
+  return best;
+}
+
+/** How a Claude Code install has auto-update set for the theshyre marketplace. */
+export type AutoUpdateState =
+  | { known: false }
+  | { known: true; on: true; source: string }
+  | { known: true; on: false };
+
+/** Where Claude Code keeps its state: `$CLAUDE_CONFIG_DIR`, else `~/.claude`. */
+function claudeConfigDir(env: Env): string {
+  return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+}
+
+function readJson(path: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is auto-update on for the theshyre marketplace on THIS machine?
+ *
+ * Claude Code leaves auto-update off for every marketplace that is not
+ * Anthropic's, and nothing a marketplace ships can change that — so a
+ * hand-installed plugin sits at the version it was installed at while
+ * releases go by. The `/plugin` toggle writes `autoUpdate` on the
+ * marketplace's entry in `known_marketplaces.json`; managed, project (and
+ * project-local) and user settings can carry
+ * `extraKnownMarketplaces.<name>.autoUpdate` too. Every layer is read; the
+ * first `true` wins — so a project's checked-in `.claude/settings.json`
+ * can turn the notice off, which is fine: Claude Code honors that same
+ * file for the real toggle. A machine where the marketplace is
+ * not known at all (no Claude Code, or the runtime installed by `curl`) is
+ * `known: false`, and nothing is said.
+ */
+export function autoUpdateState(env: Env = process.env, marketplace = "theshyre", cwd: string = process.cwd()): AutoUpdateState {
+  const dir = claudeConfigDir(env);
+  const known = readJson(join(dir, "plugins", "known_marketplaces.json"));
+  const entry = known && isRecord(known[marketplace]) ? (known[marketplace] as Record<string, unknown>) : null;
+  if (!entry) return { known: false };
+  if (entry.autoUpdate === true) return { known: true, on: true, source: "known_marketplaces.json" };
+  // Every settings layer that may carry `extraKnownMarketplaces` (managed,
+  // project local, project, user); the `--settings` flag is not a file and
+  // is not read. Precedence does not matter for a boolean read as "anyone
+  // says on".
+  const settingsFiles: Array<[path: string, label: string]> = [
+    ["/Library/Application Support/ClaudeCode/managed-settings.json", "managed settings"],
+    ["/etc/claude-code/managed-settings.json", "managed settings"],
+    [join(cwd, ".claude", "settings.local.json"), "project local settings"],
+    [join(cwd, ".claude", "settings.json"), "project settings"],
+    [join(dir, "settings.json"), "user settings"],
+  ];
+  for (const [path, label] of settingsFiles) {
+    const settings = readJson(path);
+    const extra = settings && isRecord(settings.extraKnownMarketplaces) ? settings.extraKnownMarketplaces : null;
+    const mine = extra && isRecord(extra[marketplace]) ? (extra[marketplace] as Record<string, unknown>) : null;
+    if (mine && mine.autoUpdate === true) return { known: true, on: true, source: label };
+  }
+  return { known: true, on: false };
+}
+
+/** Once a day is a reminder; every session is a nag. */
+const AUTO_UPDATE_REMINDER_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The line a Claude Code session start prints when auto-update is off for
+ * the marketplace this plugin came from — at most once a day per machine,
+ * stamped under the Shyre home. Nothing for other agents (no marketplace)
+ * and nothing when the marketplace is not known here.
+ */
+export function autoUpdateNotice(agent: Agent, env: Env = process.env, now: number = Date.now(), cwd: string = process.cwd()): string | null {
+  if (agent !== "claude") return null;
+  const state = autoUpdateState(env, "theshyre", cwd);
+  if (!state.known || state.on) return null;
+  const stamp = join(shyreHome(), "auto-update-reminded");
+  try {
+    const last = Number(readFileSync(stamp, "utf8").trim());
+    if (Number.isFinite(last) && now - last < AUTO_UPDATE_REMINDER_MS) return null;
+  } catch {
+    /* never reminded */
+  }
+  try {
+    writeAtomic(stamp, String(now), 0o600);
+  } catch {
+    /* an unwritable home still gets the line once per session */
+  }
+  return "Auto-update is off for the theshyre marketplace, so this Shyre plugin only moves when someone updates it by hand. Turn it on once: /plugin → Marketplaces → theshyre → Enable auto-update. Tell the person; this reminder comes at most once a day.";
+}
+
+/** The one line a session start prints when a newer runtime exists — into
+ *  the agent's context, so the person hears it from the agent. Nothing when
+ *  this copy is current or nothing newer is known. */
+export function staleNotice(agent: Agent = "claude", env: Env = process.env, apiUrl: string = DEFAULT_API_URL): string | null {
+  const newest = newestKnownVersion(env);
+  if (!newest || !isNewerVersion(newest.version, VERSION)) return null;
+  // The origin this install actually talks to, and only the install step
+  // the runtime actually has (codex and cursor); any other agent is told
+  // the download alone.
+  const download = `curl -fsSL ${apiUrl}/hooks/shyre-hook.mjs -o ~/.shyre/bin/shyre-hook.mjs`;
+  const how =
+    agent === "claude"
+      ? "Run /plugin update shyre@theshyre, then /reload-plugins — or turn on auto-update once: /plugin → Marketplaces → theshyre → Enable auto-update."
+      : agent === "codex" || agent === "cursor"
+        ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.`
+        : `Replace the runtime: ${download}.`;
+  return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
+}
+
 export async function cmdFlush(cfg: Config): Promise<void> {
   const dir = spoolDir();
+  // Once per sweep, only when the sweep has a credential to deliver with —
+  // "a sweep with no key does no network" is a promise the tests hold this
+  // to. Unauthenticated, cheap, and its answer is only read by the NEXT
+  // session start, so a slow server costs the sweep nothing that matters.
+  if (cfg.apiKey) await probeLatestVersion(cfg);
   const cache: ProjectsCache = {};
   const dayAgo = Date.now() - 86400 * 1000;
   const weekAgo = Date.now() - 7 * 86400 * 1000;
@@ -2220,6 +2657,21 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
     return `config file: ${mode & 0o077 ? `present — WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600"}`;
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
+  attempt("checkpoints", () => `checkpoints: ${cfg.checkpointSeconds > 0 ? `a stop after ${cfg.checkpointSeconds}s of unposted work posts it` : "off — every run waits for session end"}`);
+  attempt("auto-update", () => {
+    const state = autoUpdateState(process.env, "theshyre", cwd);
+    if (!state.known) return "auto-update: the theshyre marketplace is not known to Claude Code on this machine (a curl install, or no Claude Code)";
+    return state.on
+      ? `auto-update: on for the theshyre marketplace (per ${state.source})`
+      : "auto-update: OFF for the theshyre marketplace — /plugin → Marketplaces → theshyre → Enable auto-update; until then releases arrive only by hand";
+  });
+  attempt("latest", () => {
+    const newest = newestKnownVersion();
+    if (!newest) return "latest: unknown — no sweep has asked the server yet, and no marketplace clone was found";
+    return isNewerVersion(newest.version, VERSION)
+      ? `latest: ${newest.version} (per ${newest.source}) — this copy is ${VERSION}; run /plugin update shyre@theshyre, or enable auto-update for the theshyre marketplace`
+      : `latest: this copy (${VERSION}) is the newest anything here knows of`;
+  });
   attempt("tls", () => (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 — the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on"));
   attempt("tokens", () => tokensDoctorLine(process.env));
   // The repository the current directory is in, and whether anything names it.
@@ -2595,8 +3047,8 @@ export async function main(argv: readonly string[]): Promise<void> {
   }
   if (first === undefined || !isAgent(first)) return;
   const payload = readStdin();
-  if (second === "start") return cmdStart(first, payload);
-  if (second === "beat") return cmdBeat(first, payload, third || "tool");
+  if (second === "start") return cmdStart(first, payload, true);
+  if (second === "beat") return cmdBeat(first, payload, third || "tool", cfg);
   if (second === "end") return cmdEnd(first, payload, cfg);
 }
 
