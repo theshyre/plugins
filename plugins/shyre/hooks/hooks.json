@@ -5,8 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs", "claude", "start"],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs\" claude start",
             "timeout": 10
           }
         ]
@@ -17,8 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs", "claude", "beat", "prompt"],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs\" claude beat prompt",
             "timeout": 10
           }
         ]
@@ -30,8 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs", "claude", "beat", "tool"],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs\" claude beat tool",
             "timeout": 10
           }
         ]
@@ -42,8 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs", "claude", "beat", "tool"],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs\" claude beat tool",
             "timeout": 10
           }
         ]
@@ -54,8 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs", "claude", "beat", "stop"],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs\" claude beat stop",
             "timeout": 10
           }
         ]
@@ -66,8 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs", "claude", "end"],
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs\" claude end",
             "timeout": 10
           }
         ]

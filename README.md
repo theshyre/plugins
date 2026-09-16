@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.7.0 (2026-09-10) — see `CHANGELOG.md`.
+**Latest release:** 1.8.0 (2026-09-16) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -19,6 +19,19 @@ auto-update** — so releases land on the next launch; Claude Code leaves it
 off for every marketplace that is not Anthropic's, and until you flip it the
 plugin says so at session start, once a day, and says when a newer version
 exists.
+
+Codex installs the same plugin from the same marketplace:
+
+```bash
+codex plugin marketplace add theshyre/plugins
+codex plugin add shyre@theshyre
+```
+
+Then run `/hooks` in Codex and trust the six shyre hooks; Codex runs no
+plugin hook until you do, and asks again when a release changes one. Sign
+the MCP server in with `codex mcp login shyre`, which opens the browser. If you used the Codex
+installer before, run `node ~/.shyre/bin/shyre-hook.mjs uninstall codex`
+first so one set of hooks runs.
 
 ## What it does
 
@@ -51,7 +64,7 @@ exists.
   from this machine's Claude Code transcripts for sessions before the plugin
   was installed — timestamps only — and logs them marked *backfilled*.
 
-Codex and Cursor use the same runtime through its installer; the
+Cursor, and Codex setups that predate the plugin, use the same runtime through its installer; the
 [agent hooks kit guide](https://shyre.io/docs/guides/features/agent-hooks-kit)
 (Shyre account required) has the commands, what gets measured, what leaves the
 machine, and how to check it is working; `plugins/shyre/README.md` here has

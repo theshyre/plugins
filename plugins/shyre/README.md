@@ -1,11 +1,11 @@
-# Shyre plugin for Claude Code
+# Shyre plugin for Claude Code and Codex
 
 Deterministic time tracking for coding-agent sessions, plus the Shyre MCP
 server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.7.0 (2026-09-10) — see `../../CHANGELOG.md`.
+**Latest release:** 1.8.0 (2026-09-16) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
@@ -31,6 +31,19 @@ a token nobody typed. For the session hooks — which have no browser — export
 `SHYRE_API_KEY` (a personal access token from Settings → Integrations) in
 the shell that launches `claude`. That is the whole setup.
 
+In Codex, the same plugin installs from the same marketplace:
+
+```
+codex plugin marketplace add theshyre/plugins
+codex plugin add shyre@theshyre
+```
+
+Run `/hooks` and trust the six shyre hooks. Codex runs no plugin hook until
+you do, and asks again when a release changes one. Sign the MCP server in
+with `codex mcp login shyre`, which opens the browser. If you set Codex up with
+the installer below before, run `node ~/.shyre/bin/shyre-hook.mjs uninstall
+codex` first so one set of hooks runs.
+
 What ships:
 
 - `hooks/hooks.json` — SessionStart, UserPromptSubmit, PostToolUse,
@@ -47,7 +60,7 @@ What ships:
 - `skills/log-your-time` — how to log categorized, invoice-ready entries at
   the end of a unit of work.
 
-Other agents use the same runtime through its installer:
+Cursor, and Codex without the plugin, use the same runtime through its installer:
 
 ```
 mkdir -p ~/.shyre/bin

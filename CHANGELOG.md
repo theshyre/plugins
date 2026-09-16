@@ -4,6 +4,27 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.8.0 — 2026-09-16
+
+- **The hooks run in Codex.** Codex installs this plugin from the same
+  marketplace (`codex plugin marketplace add theshyre/plugins`, then
+  `codex plugin add shyre@theshyre`), but it drops a hook's `args`. Every
+  1.7.0 hook ran a bare `node`, which read the hook's payload as a script
+  and failed, so a Codex install recorded nothing, with no message. Each
+  hook is now one command string,
+  `node "${CLAUDE_PLUGIN_ROOT}/hooks/shyre-hook.mjs" claude <event>`, which
+  both hosts run. Codex sets `CLAUDE_PLUGIN_ROOT` too, and the runtime reads
+  the agent from the payload, so a Codex session is recorded as Codex. A
+  test in the Shyre repository now runs every hook command through a shell
+  for both hosts' payloads instead of only checking its shape. Codex asks
+  you to trust the changed hooks once in `/hooks`.
+- **The marketplace owner URL is `https://shyre.io`.** It still named the
+  old host.
+
+If you ran `shyre-hook.mjs install codex` before, remove those global hooks
+(`node ~/.shyre/bin/shyre-hook.mjs uninstall codex`) when you install the
+plugin in Codex, so one set of hooks runs.
+
 ## 1.7.0 — 2026-09-10
 
 - **The hook says so after repeated 401s (P-02).** A 401 stays a NON-final
