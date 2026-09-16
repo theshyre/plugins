@@ -119,7 +119,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.8.0";
+var VERSION = "1.9.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -201,12 +201,14 @@ function readConfig(env = process.env) {
   const fileCheckpoint = typeof file.checkpoint_seconds === "number" || typeof file.checkpoint_seconds === "string" ? file.checkpoint_seconds : void 0;
   const rawCheckpoint = env.SHYRE_CHECKPOINT_SECONDS ?? fileCheckpoint;
   const checkpoint2 = rawCheckpoint === void 0 || rawCheckpoint === "" ? DEFAULT_CHECKPOINT_SECONDS : Number(rawCheckpoint);
+  const mode = env.SHYRE_HOOK_MODE || (typeof file.hook_mode === "string" ? file.hook_mode : "");
   return {
     apiKey,
     apiUrl,
     idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900,
     // 0 is a real answer (off); anything unreadable or negative is the default.
-    checkpointSeconds: Number.isFinite(checkpoint2) && checkpoint2 >= 0 && checkpoint2 <= MAX_IDLE_CAP_SECONDS ? Math.floor(checkpoint2) : DEFAULT_CHECKPOINT_SECONDS
+    checkpointSeconds: Number.isFinite(checkpoint2) && checkpoint2 >= 0 && checkpoint2 <= MAX_IDLE_CAP_SECONDS ? Math.floor(checkpoint2) : DEFAULT_CHECKPOINT_SECONDS,
+    fold: mode.trim().toLowerCase() !== "post"
   };
 }
 function repoKeyFromRemote(remote) {
@@ -991,7 +993,7 @@ var COVERAGE_PAGE_SIZE = 100;
 async function fetchCoverage(item, cfg, tag = "") {
   const since = new Date(Date.parse(item.start_time) - 86400 * 1e3).toISOString();
   const entries = [];
-  let until = item.end_time;
+  let until = new Date(Date.parse(item.end_time) + 61 * 1e3).toISOString();
   let previousOldest = Number.POSITIVE_INFINITY;
   for (let page = 0; page < COVERAGE_MAX_PAGES; page += 1) {
     const url = `${cfg.apiUrl}/api/v1/entries?limit=${COVERAGE_PAGE_SIZE}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`;
@@ -1057,6 +1059,7 @@ async function deliver(item, cfg, projectsCache = {}) {
     logRefusal(`${tag}	note: the project this repo maps to (${projectId}) is completed; posting anyway \u2014 if the work moved on, point ~/.shyre/projects.json at it`);
   }
   const coverage = await fetchCoverage(item, cfg, tag);
+  if (cfg.fold === true && !item.backfilled) return foldRun(item, cfg, projectId, tag, coverage, ws, we);
   let segments = [[isoSeconds(ws), isoSeconds(we)]];
   if (coverage.complete) {
     segments = uncoveredSegments(coverage.entries, item.start_time, item.end_time);
@@ -1091,6 +1094,167 @@ async function deliver(item, cfg, projectsCache = {}) {
     else done.add(`${segStart}|${segEnd}`);
   }
   item.done = [...done].sort();
+  return settled;
+}
+function buildFoldBody(item, segStart, segEnd, whole) {
+  const meters = whole ? { runtimeMin: item.agent_runtime_min, waitMin: item.agent_wait_min } : item.marks ? metersFor(item.marks, segStart, segEnd) : void 0;
+  return {
+    start_time: segStart,
+    end_time: segEnd,
+    idempotency_key: `${item.session}:fold:${segStart}`.slice(0, 123),
+    agent_label: item.label.slice(0, 64),
+    // ⚠️ NO session_ref IN THE BODY. The server refuses a fold into another
+    // session's entry when both name one, and an agent's own entries carry the
+    // session id IT sees (claude.ai's `session_01…`), not the transcript UUID
+    // the hooks record — measured on 2026-09-16, every agent entry of the day.
+    // Sending it refused every fold. The X-Session-Ref header still carries it
+    // for the audit trail.
+    agent_runtime_min: meters?.runtimeMin,
+    agent_wait_min: meters?.waitMin,
+    prompt_marks: item.marks ? promptMarksFor(item.marks, segStart, segEnd) : void 0,
+    agent_tokens: whole && item.agent_tokens ? { input: item.agent_tokens.input, output: item.agent_tokens.output, cache_read: item.agent_tokens.cache_read, cache_creation: item.agent_tokens.cache_creation } : void 0,
+    agent_model: whole ? item.agent_tokens?.model : void 0,
+    agent_cost_usd_list: whole ? item.agent_tokens?.cost_usd_list : void 0
+  };
+}
+var FOLD_SLACK_MS = 60 * 1e3;
+var FOLD_HOLD_HOURS = 24;
+function foldTargets(entries, projectId, segStart, segEnd) {
+  if (!Array.isArray(entries)) return [];
+  const s = Date.parse(segStart);
+  const e = Date.parse(segEnd);
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return [];
+  let before = null;
+  let after = null;
+  for (const row of entries) {
+    if (!isRecord(row)) continue;
+    if (typeof row.id !== "string" || row.project_id !== projectId) continue;
+    if (row.started_by_kind !== "agent" || row.invoiced === true) continue;
+    if (typeof row.start_time !== "string" || typeof row.end_time !== "string") continue;
+    const rs = Date.parse(row.start_time);
+    const re = Date.parse(row.end_time);
+    if (!Number.isFinite(rs) || !Number.isFinite(re)) continue;
+    if (Math.abs(re - s) <= FOLD_SLACK_MS && (before === null || re > before.end)) before = { entry: row, end: re };
+    if (Math.abs(rs - e) <= FOLD_SLACK_MS && (after === null || rs < after.start)) after = { entry: row, start: rs };
+  }
+  const out = [];
+  if (before) out.push({ entry: before.entry, side: "end" });
+  if (after) out.push({ entry: after.entry, side: "start" });
+  return out;
+}
+function foldTarget(entries, projectId, segStart, segEnd) {
+  return foldTargets(entries, projectId, segStart, segEnd)[0] ?? null;
+}
+function closedOnTheRight(entries, projectId, segEnd) {
+  if (!Array.isArray(entries)) return false;
+  const e = Date.parse(segEnd);
+  return entries.some((row) => isRecord(row) && row.project_id === projectId && row.started_by_kind === "agent" && typeof row.start_time === "string" && Math.abs(Date.parse(row.start_time) - e) <= FOLD_SLACK_MS);
+}
+var OPEN_SESSION_STALE_MS = 6 * 36e5;
+function sessionStillOpen(agent, sessionId, nowMs) {
+  try {
+    const marks = `${stateBase(agent, sessionId)}.marks`;
+    if (!existsSync(marks)) return false;
+    return nowMs - statSync(marks).mtimeMs < OPEN_SESSION_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+async function foldRun(item, cfg, projectId, tag, coverage, ws, we) {
+  if (!coverage.complete) {
+    logRefusal(`${tag}	${coverage.reason}; kept: a fold must see the entries it extends`);
+    return false;
+  }
+  const entries = coverage.entries.map((row) => isRecord(row) ? { ...row } : row);
+  const segments = uncoveredSegments(entries, item.start_time, item.end_time);
+  if (segments.length === 0) {
+    logRefusal(`${tag}	covered: stood down, this window was already logged`);
+    return true;
+  }
+  const moving = sessionStillOpen(item.agent, item.session, Date.now());
+  const done = new Set(item.done ?? []);
+  let settled = true;
+  const unplaced = [];
+  let inProgressMs = 0;
+  for (const [segStart, segEnd] of segments) {
+    const key = `${segStart}|${segEnd}`;
+    if (done.has(key)) continue;
+    const span = Date.parse(segEnd) - Date.parse(segStart);
+    const minutes = Math.round(span / 6e4);
+    if (moving && !closedOnTheRight(entries, projectId, segEnd)) {
+      inProgressMs += span;
+      continue;
+    }
+    const targets = foldTargets(entries, projectId, segStart, segEnd);
+    if (targets.length === 0) {
+      unplaced.push([segStart, segEnd]);
+      continue;
+    }
+    const whole = Date.parse(segStart) === ws && Date.parse(segEnd) === we;
+    let outcome = "refused";
+    for (const target of targets) {
+      const id = String(target.entry.id);
+      const res = await http("POST", `${cfg.apiUrl}/api/v1/entries/${encodeURIComponent(id)}/fold`, {
+        apiKey: cfg.apiKey,
+        agent: item.agent,
+        session: item.session,
+        body: buildFoldBody(item, segStart, segEnd, whole)
+      });
+      if (res.status > 0) item.contacted = true;
+      if (res.status >= 200 && res.status < 300) {
+        const gotStart = isRecord(res.json) && typeof res.json.start_time === "string" ? Date.parse(res.json.start_time) : Number.NaN;
+        const gotEnd = isRecord(res.json) && typeof res.json.end_time === "string" ? Date.parse(res.json.end_time) : Number.NaN;
+        if (!isRecord(res.json)) {
+          logRefusal(`${tag}	fold into ${id.slice(0, 8)} answered ${res.status} without the extended entry, kept for retry`);
+          outcome = "kept";
+          break;
+        }
+        if (!(gotStart <= Date.parse(segStart) + FOLD_SLACK_MS && gotEnd >= Date.parse(segEnd) - FOLD_SLACK_MS)) {
+          logRefusal(`${tag}	fold into ${id.slice(0, 8)} answered with an entry that does not cover ${segStart}..${segEnd}`);
+          continue;
+        }
+        target.entry.start_time = res.json && isRecord(res.json) ? res.json.start_time : target.entry.start_time;
+        target.entry.end_time = res.json && isRecord(res.json) ? res.json.end_time : target.entry.end_time;
+        logRefusal(`${tag}	folded ${minutes} min (${segStart}..${segEnd}) into entry ${id.slice(0, 8)} (${target.side})`);
+        outcome = "folded";
+        break;
+      }
+      if (isFinalRefusal(res.status)) {
+        logRefusal(`${tag}	entry ${id.slice(0, 8)} refused the fold (${res.status})	${res.text.replace(/\s+/g, " ").slice(0, 300)}`);
+        continue;
+      }
+      logRefusal(`${tag}	fold into ${id.slice(0, 8)} answered ${res.status || "no network"}, kept for retry`);
+      outcome = "kept";
+      break;
+    }
+    if (outcome === "folded") done.add(key);
+    else if (outcome === "kept") settled = false;
+    else unplaced.push([segStart, segEnd]);
+  }
+  item.done = [...done].sort();
+  if (inProgressMs >= 60 * 1e3) {
+    logRefusal(`${tag}	${Math.round(inProgressMs / 6e4)} min are the unit still in progress in a live session: held until it is logged or the session stops`);
+    settled = false;
+  }
+  const unplacedMs = unplaced.reduce((n, [a, b]) => n + (Date.parse(b) - Date.parse(a)), 0);
+  if (unplacedMs >= 60 * 1e3) {
+    const minutes = Math.round(unplacedMs / 6e4);
+    const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
+    const heldSince = Number.isFinite(createdMs) ? Math.max(createdMs, we) : we;
+    if ((Date.now() - heldSince) / 36e5 < FOLD_HOLD_HOURS) {
+      logRefusal(`${tag}	${minutes} min have no agent entry on this project to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
+      return false;
+    }
+    const report = await reportDrop(item, cfg, "no_entry_to_fold_into", Math.max(0, Math.round((Date.now() - ws) / 864e5)));
+    if (report.contacted) item.contacted = true;
+    if (!report.reported) {
+      logRefusal(`${tag}	${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h; the server could not be told (${report.why}), kept until it can`);
+      return false;
+    }
+    for (const [a, b] of unplaced) done.add(`${a}|${b}`);
+    item.done = [...done].sort();
+    logRefusal(`${tag}	${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h: not logged, and reported`);
+  }
   return settled;
 }
 function isWhole(segments, ws, we) {
@@ -2093,9 +2257,12 @@ export {
   DROP_GIVE_UP_ATTEMPTS,
   DROP_GIVE_UP_DAYS,
   DROP_REPORT_PATH,
+  FOLD_HOLD_HOURS,
+  FOLD_SLACK_MS,
   HOOK_WIRING,
   MAX_IDLE_CAP_SECONDS,
   MAX_TRIES,
+  OPEN_SESSION_STALE_MS,
   POST_INSTALL_NOTES,
   PROMPT_MARKS_MAX,
   PRUNE_AFTER_DAYS,
@@ -2106,8 +2273,10 @@ export {
   autoUpdateState,
   backfillOptions,
   buildEntryBody,
+  buildFoldBody,
   checkpoint,
   claudeShapedHooks,
+  closedOnTheRight,
   cmdBackfill,
   cmdBeat,
   cmdEnd,
@@ -2120,6 +2289,8 @@ export {
   doctorLines,
   earliestFreeStart,
   fetchCoverage,
+  foldTarget,
+  foldTargets,
   formatBackfillPlan,
   gitRemote,
   hooksSessionMoving,
@@ -2153,6 +2324,7 @@ export {
   resolveFromMap,
   scrapeSessionTokens,
   segmentRuns,
+  sessionStillOpen,
   shyreHome,
   staleNotice,
   tokenRefusalNotice,

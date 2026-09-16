@@ -4,6 +4,30 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.9.0 — 2026-09-16
+
+- **No more "session — active time" entries.** The hook used to post each
+  stretch of a session that no entry covered as an entry of its own:
+  "Claude Code session — active time (idle gaps excluded); see transcript",
+  with no category, often two to six minutes long, and often landing before
+  a parallel session logged the work beside it. One day had twelve of them
+  among sixteen real entries. Now each stretch **extends the agent entry
+  beside it** on the same project (`POST /api/v1/entries/<id>/fold`), and
+  its meters — runtime, waiting, prompt instants, and tokens for the same
+  model — add to that entry's. The entry keeps its category, description and
+  ticket link.
+- **A stretch with nothing beside it is held, not posted.** A parallel
+  session may log the neighboring entry later, so the run waits up to a day;
+  after that it is reported as dropped (`no_entry_to_fold_into`) and shows in
+  your activity list. Hand-typed and invoiced entries are never extended.
+- **Backfill is unchanged.** `backfill` still posts reconstructed runs as
+  entries of their own, marked backfilled — those days usually have nothing
+  to extend.
+- **The old behavior is one setting away:** `SHYRE_HOOK_MODE=post`, or
+  `"hook_mode": "post"` in `~/.shyre/config.json`.
+
+Needs the Shyre server from 2026-09-16 or later (shyre.io already runs it).
+
 ## 1.8.0 — 2026-09-16
 
 - **The hooks run in Codex.** Codex installs this plugin from the same

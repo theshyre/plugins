@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.8.0 (2026-09-16) — see `CHANGELOG.md`.
+**Latest release:** 1.9.0 (2026-09-16) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -35,19 +35,23 @@ first so one set of hooks runs.
 
 ## What it does
 
-- **Time logs itself.** Every session records each run of activity as a
-  time entry on the right project, with the agent named on the entry and
-  both meters on it: the human's attended time and the machine's runtime.
-  Entries post while you work — a run that ends at an idle gap posts at
-  once, and an open run with more than half an hour unposted posts a
-  checkpoint when the agent's turn ends — so a day's work is in Shyre while
-  it happens, not at the end of the day.
+- **Time logs itself.** Every session's active time lands on the right
+  project: each stretch no entry covers extends the agent's own entry beside
+  it — keeping that entry's category, description and ticket — and adds both
+  meters to it: the human's attended time and the machine's runtime. It
+  happens while you work — a run that ends at an idle gap is delivered at
+  once, and an open run with more than half an hour undelivered is
+  delivered when the agent's turn ends — so a day's work is in Shyre while
+  it happens, and never as a stack of uncategorized "session" entries. A
+  stretch with no entry beside it waits a day for one, then is reported as
+  dropped.
 - **Tokens ride along.** When Claude Code's metrics exporter is on, the
   session's token counts, model and list-price estimate travel with the last
   run. Absent is absent, never zero.
 - **Nothing is invented.** A run under a minute is dropped; a run mapped to
   an archived project is kept back with the reason; a window an entry
-  already covers is skipped; an entry that cannot be delivered waits, and is
+  already covers is skipped; a hand-typed or invoiced entry is never
+  extended; an entry that cannot be delivered waits, and is
   dropped only after the server has been told.
 - **A dead token says so.** A 401 never drops a spooled run — it survives a
   token rotation — but after three refused deliveries in a row, session

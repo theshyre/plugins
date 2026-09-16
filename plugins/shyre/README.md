@@ -5,7 +5,7 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.8.0 (2026-09-16) — see `../../CHANGELOG.md`.
+**Latest release:** 1.9.0 (2026-09-16) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
@@ -22,7 +22,7 @@ the problem: `SHYRE_API_KEY` refuses with a 401 on rotation or expiry the
 same as on revocation, and a 401 never drops a spooled run — but after three
 refused deliveries in a row, session start reports how many times and since
 when, and points at `/settings/integrations` to re-mint it; the spooled
-runs are kept and post once a working key is in place. `doctor` shows the
+runs are kept and are delivered once a working key is in place. `doctor` shows the
 same streak on its `token:` line.
 
 The MCP tools sign in on first use: Claude Code opens a browser tab (`/mcp`
@@ -48,11 +48,13 @@ What ships:
 
 - `hooks/hooks.json` — SessionStart, UserPromptSubmit, PostToolUse,
   SubagentStop, Stop and SessionEnd all run `hooks/shyre-hook.mjs`, the Node
-  runtime that records activity marks and spools one time entry per run of
-  activity — at session end, and along the way: a run that ends at an idle
-  gap posts at once, and an open run with more than half an hour unposted
-  posts a checkpoint entry when the agent's turn ends, so a day's work is in
-  Shyre while it happens. It is built from `hooks/shyre-hook.ts`, the
+  runtime that records activity marks and delivers each run of activity by
+  extending the agent's own entry beside it on the project (meters and all)
+  — at session end, and along the way: a run that ends at an idle gap is
+  delivered at once, and an open run with more than half an hour
+  undelivered is delivered when the agent's turn ends, so a day's work is in
+  Shyre while it happens. A run with no entry beside it waits a day, then is
+  reported as dropped; `SHYRE_HOOK_MODE=post` restores posting entries. It is built from `hooks/shyre-hook.ts`, the
   TypeScript source shipped beside it; the artifact is one plain JavaScript
   file with no dependencies, because a hook runs as a bare `node` command.
 - `.mcp.json` — the Shyre MCP server. No key in it: the agent signs in

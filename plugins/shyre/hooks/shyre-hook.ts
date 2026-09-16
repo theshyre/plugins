@@ -116,7 +116,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.8.0";
+export const VERSION = "1.9.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -206,6 +206,13 @@ export interface Config {
    *  as a checkpoint entry (1.6.0). 0 turns checkpoints off: everything
    *  waits for session end, as before. */
   checkpointSeconds: number;
+  /** Live runs FOLD their uncovered minutes into an adjacent agent entry on
+   *  the same project instead of posting an entry of their own (1.9.0). A
+   *  standalone "session — active time" entry had no category and no real
+   *  description, and landed before a parallel session's entries could cover
+   *  it. `hook_mode: "post"` (or SHYRE_HOOK_MODE=post) keeps the old
+   *  behavior. Absent means post, so a hand-built config is explicit. */
+  fold?: boolean;
 }
 
 /** One queued run, as written to ~/.shyre/spool. */
@@ -373,6 +380,7 @@ export function readConfig(env: Env = process.env): Config {
   const fileCheckpoint = typeof file.checkpoint_seconds === "number" || typeof file.checkpoint_seconds === "string" ? file.checkpoint_seconds : undefined;
   const rawCheckpoint = env.SHYRE_CHECKPOINT_SECONDS ?? fileCheckpoint;
   const checkpoint = rawCheckpoint === undefined || rawCheckpoint === "" ? DEFAULT_CHECKPOINT_SECONDS : Number(rawCheckpoint);
+  const mode = env.SHYRE_HOOK_MODE || (typeof file.hook_mode === "string" ? file.hook_mode : "");
   // Bounded above as well as below: a cap of 1e9 would turn elapsed span
   // into "active time", which is the one thing the meter must never do.
   return {
@@ -381,6 +389,7 @@ export function readConfig(env: Env = process.env): Config {
     idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900,
     // 0 is a real answer (off); anything unreadable or negative is the default.
     checkpointSeconds: Number.isFinite(checkpoint) && checkpoint >= 0 && checkpoint <= MAX_IDLE_CAP_SECONDS ? Math.floor(checkpoint) : DEFAULT_CHECKPOINT_SECONDS,
+    fold: mode.trim().toLowerCase() !== "post",
   };
 }
 
@@ -1622,7 +1631,9 @@ export const COVERAGE_PAGE_SIZE = 100;
 export async function fetchCoverage(item: SpoolItem, cfg: Config, tag = ""): Promise<Coverage> {
   const since = new Date(Date.parse(item.start_time) - 86400 * 1000).toISOString();
   const entries: unknown[] = [];
-  let until = item.end_time;
+  // A minute past the end, and a second: an entry starting just after the
+  // run is one a fold may extend backward, and the list's bound is strict.
+  let until = new Date(Date.parse(item.end_time) + 61 * 1000).toISOString();
   let previousOldest = Number.POSITIVE_INFINITY;
   for (let page = 0; page < COVERAGE_MAX_PAGES; page += 1) {
     const url = `${cfg.apiUrl}/api/v1/entries?limit=${COVERAGE_PAGE_SIZE}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`;
@@ -1713,6 +1724,9 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
   // was a hook entry on the child project under the agent's own entries on
   // the parent, and a per-project check could not see them.
   const coverage = await fetchCoverage(item, cfg, tag);
+  // A backfill is an explicit command over days that may have no entries at
+  // all; it posts as it always did. A live run folds.
+  if (cfg.fold === true && !item.backfilled) return foldRun(item, cfg, projectId, tag, coverage, ws, we);
   let segments: Segment[] = [[isoSeconds(ws), isoSeconds(we)]];
   if (coverage.complete) {
     segments = uncoveredSegments(coverage.entries, item.start_time, item.end_time);
@@ -1759,6 +1773,245 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
     else done.add(`${segStart}|${segEnd}`);
   }
   item.done = [...done].sort();
+  return settled;
+}
+
+/** The fields a fold sends, and nothing else (POST /api/v1/entries/<id>/fold,
+ *  server 20260916214100). The window grows and the stretch's meters ADD to
+ *  the entry's. Tokens ride only on the whole run, as on a post: a segment
+ *  cannot apportion them. The /agents page prints exactly these keys. */
+export function buildFoldBody(item: SpoolItem, segStart: string, segEnd: string, whole: boolean): Record<string, unknown> {
+  const meters = whole ? { runtimeMin: item.agent_runtime_min, waitMin: item.agent_wait_min } : item.marks ? metersFor(item.marks, segStart, segEnd) : undefined;
+  return {
+    start_time: segStart,
+    end_time: segEnd,
+    idempotency_key: `${item.session}:fold:${segStart}`.slice(0, 123),
+    agent_label: item.label.slice(0, 64),
+    // ⚠️ NO session_ref IN THE BODY. The server refuses a fold into another
+    // session's entry when both name one, and an agent's own entries carry the
+    // session id IT sees (claude.ai's `session_01…`), not the transcript UUID
+    // the hooks record — measured on 2026-09-16, every agent entry of the day.
+    // Sending it refused every fold. The X-Session-Ref header still carries it
+    // for the audit trail.
+    agent_runtime_min: meters?.runtimeMin,
+    agent_wait_min: meters?.waitMin,
+    prompt_marks: item.marks ? promptMarksFor(item.marks, segStart, segEnd) : undefined,
+    agent_tokens: whole && item.agent_tokens
+      ? { input: item.agent_tokens.input, output: item.agent_tokens.output, cache_read: item.agent_tokens.cache_read, cache_creation: item.agent_tokens.cache_creation }
+      : undefined,
+    agent_model: whole ? item.agent_tokens?.model : undefined,
+    agent_cost_usd_list: whole ? item.agent_tokens?.cost_usd_list : undefined,
+  };
+}
+
+/** Slack either side of an entry's edge that still counts as adjacent. */
+export const FOLD_SLACK_MS = 60 * 1000;
+/** Hours an uncovered stretch waits for an entry to fold into — a parallel
+ *  session may log the neighboring unit after this one ended — before it is
+ *  reported as dropped. */
+export const FOLD_HOLD_HOURS = 24;
+
+/** The entry an uncovered stretch extends, and which edge moves. */
+export interface FoldTarget {
+  entry: Record<string, unknown>;
+  side: "start" | "end";
+}
+
+/**
+ * The agent entries on `projectId` that a stretch [segStart, segEnd) could
+ * extend, in the order to try: the one ending where the stretch starts (the
+ * work carried on), then the one starting where it ends. Only agent-created,
+ * uninvoiced, finished entries qualify — the rows the fold RPC will change; a
+ * hand-typed entry is never stretched by a hook. Both are returned because
+ * the first may belong to a parallel session on the same project and refuse.
+ */
+export function foldTargets(entries: unknown, projectId: string, segStart: string, segEnd: string): FoldTarget[] {
+  if (!Array.isArray(entries)) return [];
+  const s = Date.parse(segStart);
+  const e = Date.parse(segEnd);
+  if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return [];
+  let before: { entry: Record<string, unknown>; end: number } | null = null;
+  let after: { entry: Record<string, unknown>; start: number } | null = null;
+  for (const row of entries as unknown[]) {
+    if (!isRecord(row)) continue;
+    if (typeof row.id !== "string" || row.project_id !== projectId) continue;
+    if (row.started_by_kind !== "agent" || row.invoiced === true) continue;
+    if (typeof row.start_time !== "string" || typeof row.end_time !== "string") continue;
+    const rs = Date.parse(row.start_time);
+    const re = Date.parse(row.end_time);
+    if (!Number.isFinite(rs) || !Number.isFinite(re)) continue;
+    if (Math.abs(re - s) <= FOLD_SLACK_MS && (before === null || re > before.end)) before = { entry: row, end: re };
+    if (Math.abs(rs - e) <= FOLD_SLACK_MS && (after === null || rs < after.start)) after = { entry: row, start: rs };
+  }
+  const out: FoldTarget[] = [];
+  if (before) out.push({ entry: before.entry, side: "end" });
+  if (after) out.push({ entry: after.entry, side: "start" });
+  return out;
+}
+
+/** The first of `foldTargets`, or null. */
+export function foldTarget(entries: unknown, projectId: string, segStart: string, segEnd: string): FoldTarget | null {
+  return foldTargets(entries, projectId, segStart, segEnd)[0] ?? null;
+}
+
+/**
+ * Does one of your entries on THIS project start where the stretch ends?
+ * Then the stretch is closed on the right: the next unit has been logged, and
+ * the stretch is a gap between logged work, not the unit still in progress.
+ * Another project's entry does not close it — that is a parallel session,
+ * and this session's unit may still be open beside it.
+ */
+export function closedOnTheRight(entries: unknown, projectId: string, segEnd: string): boolean {
+  if (!Array.isArray(entries)) return false;
+  const e = Date.parse(segEnd);
+  // An AGENT entry: a hand-typed meeting starting at that instant says nothing
+  // about whether the agent's unit was logged.
+  return (entries as unknown[]).some((row) => isRecord(row) && row.project_id === projectId && row.started_by_kind === "agent" && typeof row.start_time === "string" && Math.abs(Date.parse(row.start_time) - e) <= FOLD_SLACK_MS);
+}
+
+/** How long a session's marks file may sit unwritten and still count as an
+ *  open session. Not the idle cap: lunch, a twenty-minute build or a slow turn
+ *  all pass fifteen minutes with the session still open. A crashed session
+ *  that never reached SessionEnd stops counting after this. */
+export const OPEN_SESSION_STALE_MS = 6 * 3_600_000;
+
+/** The session has not ended: its marks file is still there (SessionEnd
+ *  removes it) and was written within OPEN_SESSION_STALE_MS. */
+export function sessionStillOpen(agent: string, sessionId: string, nowMs: number): boolean {
+  try {
+    const marks = `${stateBase(agent, sessionId)}.marks`;
+    if (!existsSync(marks)) return false;
+    return nowMs - statSync(marks).mtimeMs < OPEN_SESSION_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Deliver a live run by folding (1.9.0): every uncovered stretch extends an
+ * adjacent agent entry on the run's project, and nothing is posted as an
+ * entry of its own.
+ *
+ * ⚠️ NOT THE UNIT STILL IN PROGRESS. While the session is still open, a
+ * stretch with nothing logged after it is the work the agent has not logged
+ * yet — a checkpoint cut mid-unit. Folding it into the PREVIOUS unit's entry
+ * put the current unit's minutes on the wrong ticket, and the agent's own
+ * entry then 409'd against it. Such a stretch is held; when the agent logs
+ * the unit, the next sweep finds it covered. Once the session has stopped
+ * moving, whatever is left folds.
+ *
+ * A stretch with nothing to extend is held for the next sweep, and after
+ * FOLD_HOLD_HOURS — counted from when this machine first spooled the run,
+ * not from the run's end, so a laptop that was offline for two days still
+ * gets its day — it is reported as dropped once and settled, never posted
+ * blind. Coverage that cannot be read keeps the run: folding without seeing
+ * the entries is guessing.
+ */
+async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: string, coverage: Coverage, ws: number, we: number): Promise<boolean> {
+  if (!coverage.complete) {
+    logRefusal(`${tag}\t${coverage.reason}; kept: a fold must see the entries it extends`);
+    return false;
+  }
+  const entries = coverage.entries.map((row) => (isRecord(row) ? { ...row } : row));
+  const segments = uncoveredSegments(entries, item.start_time, item.end_time);
+  if (segments.length === 0) {
+    logRefusal(`${tag}\tcovered: stood down, this window was already logged`);
+    return true;
+  }
+  const moving = sessionStillOpen(item.agent, item.session, Date.now());
+  const done = new Set(item.done ?? []);
+  let settled = true;
+  const unplaced: Segment[] = [];
+  let inProgressMs = 0;
+  for (const [segStart, segEnd] of segments) {
+    const key = `${segStart}|${segEnd}`;
+    if (done.has(key)) continue;
+    const span = Date.parse(segEnd) - Date.parse(segStart);
+    const minutes = Math.round(span / 60000);
+    if (moving && !closedOnTheRight(entries, projectId, segEnd)) {
+      inProgressMs += span;
+      continue;
+    }
+    const targets = foldTargets(entries, projectId, segStart, segEnd);
+    if (targets.length === 0) {
+      unplaced.push([segStart, segEnd]);
+      continue;
+    }
+    const whole = Date.parse(segStart) === ws && Date.parse(segEnd) === we;
+    let outcome: "folded" | "refused" | "kept" = "refused";
+    for (const target of targets) {
+      const id = String(target.entry.id);
+      const res = await http("POST", `${cfg.apiUrl}/api/v1/entries/${encodeURIComponent(id)}/fold`, {
+        apiKey: cfg.apiKey,
+        agent: item.agent,
+        session: item.session,
+        body: buildFoldBody(item, segStart, segEnd, whole),
+      });
+      if (res.status > 0) item.contacted = true;
+      if (res.status >= 200 && res.status < 300) {
+        // A 2xx is a fold only when its body is the entry, now covering the
+        // stretch (an HTML page from something in front of the API is not).
+        const gotStart = isRecord(res.json) && typeof res.json.start_time === "string" ? Date.parse(res.json.start_time) : Number.NaN;
+        const gotEnd = isRecord(res.json) && typeof res.json.end_time === "string" ? Date.parse(res.json.end_time) : Number.NaN;
+        if (!isRecord(res.json)) {
+          logRefusal(`${tag}\tfold into ${id.slice(0, 8)} answered ${res.status} without the extended entry, kept for retry`);
+          outcome = "kept";
+          break;
+        }
+        if (!(gotStart <= Date.parse(segStart) + FOLD_SLACK_MS && gotEnd >= Date.parse(segEnd) - FOLD_SLACK_MS)) {
+          // An entry that does not cover the stretch — a replay of an earlier
+          // fold answering with an entry shortened since. Not a fold; the
+          // next neighbor, or the hold, decides.
+          logRefusal(`${tag}\tfold into ${id.slice(0, 8)} answered with an entry that does not cover ${segStart}..${segEnd}`);
+          continue;
+        }
+        // The extended entry is what the next stretch may touch.
+        target.entry.start_time = res.json && isRecord(res.json) ? res.json.start_time : target.entry.start_time;
+        target.entry.end_time = res.json && isRecord(res.json) ? res.json.end_time : target.entry.end_time;
+        logRefusal(`${tag}\tfolded ${minutes} min (${segStart}..${segEnd}) into entry ${id.slice(0, 8)} (${target.side})`);
+        outcome = "folded";
+        break;
+      }
+      if (isFinalRefusal(res.status)) {
+        // This entry would not stretch (another session's, invoiced since, a
+        // period lock, an overlap): try the other neighbor, if there is one.
+        logRefusal(`${tag}\tentry ${id.slice(0, 8)} refused the fold (${res.status})\t${res.text.replace(/\s+/g, " ").slice(0, 300)}`);
+        continue;
+      }
+      logRefusal(`${tag}\tfold into ${id.slice(0, 8)} answered ${res.status || "no network"}, kept for retry`);
+      outcome = "kept";
+      break;
+    }
+    if (outcome === "folded") done.add(key);
+    else if (outcome === "kept") settled = false;
+    else unplaced.push([segStart, segEnd]);
+  }
+  item.done = [...done].sort();
+  if (inProgressMs >= 60 * 1000) {
+    logRefusal(`${tag}\t${Math.round(inProgressMs / 60000)} min are the unit still in progress in a live session: held until it is logged or the session stops`);
+    settled = false;
+  }
+  const unplacedMs = unplaced.reduce((n, [a, b]) => n + (Date.parse(b) - Date.parse(a)), 0);
+  if (unplacedMs >= 60 * 1000) {
+    const minutes = Math.round(unplacedMs / 60000);
+    const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
+    const heldSince = Number.isFinite(createdMs) ? Math.max(createdMs, we) : we;
+    if ((Date.now() - heldSince) / 3_600_000 < FOLD_HOLD_HOURS) {
+      logRefusal(`${tag}\t${minutes} min have no agent entry on this project to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
+      return false;
+    }
+    const report = await reportDrop(item, cfg, "no_entry_to_fold_into", Math.max(0, Math.round((Date.now() - ws) / 86_400_000)));
+    if (report.contacted) item.contacted = true;
+    if (!report.reported) {
+      logRefusal(`${tag}\t${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h; the server could not be told (${report.why}), kept until it can`);
+      return false;
+    }
+    // Reported once: those stretches are settled, and a later sweep of this
+    // item (kept for another stretch's retry) does not report them again.
+    for (const [a, b] of unplaced) done.add(`${a}|${b}`);
+    item.done = [...done].sort();
+    logRefusal(`${tag}\t${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h: not logged, and reported`);
+  }
   return settled;
 }
 
@@ -1917,7 +2170,7 @@ export const DROP_GIVE_UP_ATTEMPTS = 3;
  *  ("/Users/…/client-secret", "file:///…", a network share) is a working
  *  directory by another name, which the payload promise says never leaves. */
 const REPO_KEY_SHAPE = /^(?!\.{1,2}\/)[a-z0-9._-]+\/[a-z0-9._-]+$/;
-export type DropReason = "retry_window_elapsed" | "retry_cap_reached";
+export type DropReason = "retry_window_elapsed" | "retry_cap_reached" | "no_entry_to_fold_into";
 
 /**
  * Tell the server a run is about to be dropped. Sent BEFORE the delete:

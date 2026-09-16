@@ -5,15 +5,19 @@ description: Log the time you just spent to Shyre when you finish a substantial 
 
 # Log your own time to Shyre
 
-The session hooks record every session as a backstop — in checkpoints
-along the way (a stretch of half an hour or more posts when your turn ends),
-not only at session end. This skill is the intent layer: when you finish a
+The session hooks record every session as a backstop — along the way, not
+only at session end — but since plugin 1.9.0 they never post an entry of
+their own: minutes your entries do not cover are added to your adjacent entry
+on the same project (its window grows, and the session's meters ride along),
+and the minutes of the unit you are still working on wait until you log it.
+So the entries are yours. This skill is the intent layer: when you finish a
 unit of work, write the entry yourself, with a real description and the right
 category. The hook stands down for the minutes your entries already cover, on
-any project, so nothing is counted twice; and where a checkpoint already
-covers some of the minutes you are about to log, the server answers your
-post with a 409 — retry once with the earliest free start it names, or, if
-it says the window is already covered, do not re-log it.
+any project, so nothing is counted twice. If the server answers your post
+with a 409 because an entry of yours on this project already reaches into
+the window (the hook extended it over a gap), retry once with the earliest
+free start it names; if it says the window is already covered, do not
+re-log it.
 
 **Local override:** if the repo's own `CLAUDE.md` or `AGENTS.md` defines its
 own time-logging convention, follow that instead.
