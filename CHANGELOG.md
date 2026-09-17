@@ -4,6 +4,48 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.10.1 — 2026-09-17
+
+Hardening, from an audit of every place the runtime deletes something and a
+hostile-input test of the built file (405 malformed payloads: every one exit 0,
+under 50 ms — that contract held). What could be lost before, and cannot now:
+
+- **A session that never ended was deleted a week later, unspooled.** Three
+  hours of one autonomous turn and a closed terminal — or any host that never
+  fires its session-end hook — was three hours gone, with a log line that named
+  no minutes. The next sweep now **spools those marks** exactly as a session
+  end would, and delivers them. A long session's header, written once, no
+  longer makes a live session look stale.
+- **A late payload lost the mark.** The hook read its input once; a host that
+  wrote it twenty milliseconds late, or in two pieces, got one `EAGAIN` and
+  nothing recorded — and a late session-end lost the final stretch. It now
+  waits for the payload (up to a second), and accepts one that starts with a
+  byte-order mark.
+- **A run from an unmapped repository is kept thirty days**, as `doctor`
+  always said, instead of being deleted on the first sweep — add the map line a
+  week later and the week comes back. After thirty days it is removed with the
+  minutes named, and never reported to the server.
+- **A refusal that loses time is told to the server in every mode** — post
+  mode and backfills too — and kept until recorded. An overlap (`409`) is kept,
+  not settled: the server raises it for a *partial* overlap too, so the next
+  sweep reads coverage again and posts only the uncovered part; after three
+  answered sweeps it is reported like any other loss.
+- **A drop report names the repository only when your own map file names
+  it.** A run whose project lookup failed cannot be told from an unmapped one,
+  and used to be reported with its repository at day thirty.
+- **Runs spooled by an older runtime** no longer fall to a twenty-sweep cap
+  that a dead token reaches in a day; **a session end that cannot read the
+  marks** leaves them; **a checkpoint** no longer throws away marks that
+  parallel tool calls appended while it was spooling.
+- The hook no longer appends through a symlink (marks or log), records a
+  session whose id is too long for a file name, leaves a read-only home
+  read-only, and bounds the log (2,000 characters a line, five megabytes a
+  file).
+- An entry posted after the day's hold says so in its description, and no
+  description says "see transcript" any more — a description can reach an
+  invoice line. `doctor`'s numbers match the rules, and its two `server:`
+  lines are now `version-check:` and `server:`.
+
 ## 1.10.0 — 2026-09-17
 
 - **The Claude Code plugin keeps itself current.** Claude Code auto-updates

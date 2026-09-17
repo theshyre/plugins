@@ -5,7 +5,7 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.10.0 (2026-09-17) — see `../../CHANGELOG.md`.
+**Latest release:** 1.10.1 (2026-09-17) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins

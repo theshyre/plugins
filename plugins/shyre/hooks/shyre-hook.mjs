@@ -8,22 +8,27 @@
 
 // plugins/shyre/hooks/shyre-hook.ts
 import { spawn, spawnSync, execFileSync } from "node:child_process";
-import { createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
 import {
-  appendFileSync,
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
   statSync,
   unlinkSync,
-  writeFileSync
+  writeFileSync,
+  writeSync
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
@@ -123,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.10.0";
+var VERSION = "1.10.1";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -309,7 +314,10 @@ function buildEntryBody(item) {
     project_id: item.project_id,
     start_time: item.start_time,
     end_time: item.end_time,
-    description: item.backfilled ? `${item.label} session \u2014 backfilled from local history after the fact; active time (idle gaps excluded)` : `${item.label} session \u2014 active time (idle gaps excluded); see transcript`,
+    // A description can end up on an invoice line a client reads, so it says
+    // what the time IS and nothing about where to look ("see transcript" sent
+    // a client looking for something they cannot see).
+    description: item.backfilled ? `${item.label} session \u2014 backfilled from local history after the fact; active time (idle gaps excluded)` : item.held ? `${item.label} session \u2014 active time (idle gaps excluded); recorded a day later because no entry was logged for it` : `${item.label} session \u2014 active time (idle gaps excluded)`,
     agent_label: item.label,
     session_ref: item.session_ref,
     idempotency_key: item.idempotency_key,
@@ -425,7 +433,8 @@ function ensureDir(p) {
 function ensurePrivateDir(p) {
   mkdirSync(p, { recursive: true, mode: 448 });
   try {
-    chmodSync(p, 448);
+    const st = lstatSync(p);
+    if (st.isDirectory() && (st.mode & 63) !== 0) chmodSync(p, 448);
   } catch {
   }
   return p;
@@ -463,8 +472,18 @@ function spoolDir() {
   return ensurePrivateDir(join(shyreHome(), "spool"));
 }
 function stateBase(agent, session) {
-  const safe = String(session).replace(/[^A-Za-z0-9._-]/g, "_");
+  const flat = String(session).replace(/[^A-Za-z0-9._-]/g, "_");
+  const safe = flat.length <= 120 ? flat : `${flat.slice(0, 80)}-${createHash("sha256").update(String(session)).digest("hex").slice(0, 24)}`;
   return join(sessionsDir(), `${agent}-${safe}`);
+}
+function appendLine(path, line) {
+  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0);
+  const fd = openSync(path, flags, 384);
+  try {
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
+  }
 }
 function refusalLogPath(env = process.env) {
   const fallback = join(shyreHome(), "refusals.log");
@@ -474,23 +493,31 @@ function refusalLogPath(env = process.env) {
   const target = resolve(raw);
   return target.startsWith(`${home}${sep}`) ? target : fallback;
 }
+var REFUSAL_LINE_MAX = 2e3;
+var REFUSAL_LOG_MAX_BYTES = 5 * 1024 * 1024;
+function rotateRefusalLog(target) {
+  try {
+    const st = lstatSync(target);
+    if (st.isFile() && st.size > REFUSAL_LOG_MAX_BYTES) renameSync(target, `${target}.1`);
+  } catch {
+  }
+}
 function logRefusal(line) {
   try {
     const target = refusalLogPath();
     ensureDir(join(target, ".."));
-    const flat = line.replace(/[\r\n]+/g, " ");
-    appendFileSync(target, `${(/* @__PURE__ */ new Date()).toISOString()}	${flat}
+    const flat = line.replace(/[\r\n]+/g, " ").slice(0, REFUSAL_LINE_MAX);
+    rotateRefusalLog(target);
+    appendLine(target, `${(/* @__PURE__ */ new Date()).toISOString()}	${flat}
 `);
-    try {
-      chmodSync(target, 384);
-    } catch {
-    }
   } catch {
   }
 }
 function noteOncePerMinute(subject, line) {
   try {
-    const marker = join(ensurePrivateDir(shyreHome()), `.said-${subject}`);
+    const flat = subject.replace(/[^A-Za-z0-9._-]/g, "_");
+    const safe = flat.length <= 80 ? flat : `${flat.slice(0, 48)}-${createHash("sha256").update(subject).digest("hex").slice(0, 24)}`;
+    const marker = join(ensurePrivateDir(shyreHome()), `.said-${safe}`);
     const last = modeOf(marker) === void 0 ? 0 : statSync(marker).mtimeMs;
     if (Date.now() - last < 6e4) return;
     writeFileSync(marker, "", { mode: 384 });
@@ -659,10 +686,44 @@ function nowIso() {
   return isoSeconds(Date.now());
 }
 var STDIN_MAX_BYTES = 4 * 1024 * 1024;
+var STDIN_WAIT_MS = 1e3;
+function readStdinText() {
+  let kind;
+  try {
+    kind = fstatSync(0);
+  } catch {
+    return "";
+  }
+  if (kind.isCharacterDevice()) return "";
+  void process.stdin.isTTY;
+  const fd = 0;
+  const chunks = [];
+  const buf = Buffer.allocUnsafe(64 * 1024);
+  const deadline = Date.now() + STDIN_WAIT_MS;
+  let total2 = 0;
+  for (; ; ) {
+    let n;
+    try {
+      n = readSync(fd, buf, 0, buf.length, null);
+    } catch (err) {
+      const code = isRecord(err) ? err.code : void 0;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") {
+        if (Date.now() >= deadline) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        continue;
+      }
+      if (code === "EOF") break;
+      throw err;
+    }
+    if (n === 0) break;
+    total2 += n;
+    if (total2 <= STDIN_MAX_BYTES + buf.length) chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 function readStdin() {
   try {
-    if (process.stdin.isTTY) return {};
-    const text = readFileSync(0, "utf8");
+    const text = readStdinText().replace(/^\uFEFF/, "");
     if (text.length > STDIN_MAX_BYTES) {
       noteOncePerMinute("stdin-size", `payload of ${text.length} bytes ignored: larger than ${STDIN_MAX_BYTES}`);
       return {};
@@ -705,8 +766,8 @@ function cmdStart(argvAgent, payload, announce = false) {
     };
     writeAtomic(`${base}.meta.json`, JSON.stringify(meta), 384);
   }
-  appendFileSync(`${base}.marks`, `${nowIso()} start
-`, { mode: 384 });
+  appendLine(`${base}.marks`, `${nowIso()} start
+`);
   const notices = announce ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n) => n !== null) : [];
   for (const notice of notices) {
     try {
@@ -728,8 +789,8 @@ function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   if (!existsSync(`${base}.meta.json`)) cmdStart(agent, payload);
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
   const now = Date.now();
-  appendFileSync(`${base}.marks`, `${isoSeconds(now)} ${k}
-`, { mode: 384 });
+  appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}
+`);
   try {
     if (cfg.checkpointSeconds <= 0) return;
     const marks = parseMarks(readFileSync(`${base}.marks`, "utf8")).sort((a, b) => a.t - b.t);
@@ -807,7 +868,13 @@ function checkpoint(agent, base, meta, capSeconds, cutAtMs) {
     return 0;
   }
   try {
-    writeAtomic(`${base}.marks`, remainder.map((m) => `${isoSeconds(m.t)} ${m.k}
+    let latest = remainder;
+    try {
+      latest = [...parseMarks(readFileSync(`${base}.marks`, "utf8"))].sort((a, b) => a.t - b.t).filter((m) => m.t >= cut);
+    } catch {
+      latest = remainder;
+    }
+    writeAtomic(`${base}.marks`, latest.map((m) => `${isoSeconds(m.t)} ${m.k}
 `).join(""), 384);
   } catch (err) {
     logRefusal(`${basename(base)}	checkpoint spooled ${runs.length} run(s) but could not rewrite the marks (${errorMessage(err)}); they will be re-spooled under the same keys`);
@@ -945,7 +1012,11 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
   let marksText = "";
   try {
     marksText = readFileSync(`${base}.marks`, "utf8");
-  } catch {
+  } catch (err) {
+    if (!(isRecord(err) && err.code === "ENOENT")) {
+      logRefusal(`${basename(base)}	session end could not read the marks (${errorMessage(err)}); left in place for the next sweep`);
+      return;
+    }
     marksText = "";
   }
   const runs = segmentRuns(parseMarks(marksText), idleCapSeconds);
@@ -1114,8 +1185,14 @@ async function deliver(item, cfg, projectsCache = {}) {
       logRefusal(`${tag}	the project this repo maps to is ${resolved.status}: nothing logged; point ~/.shyre/projects.json at the work in flight (kept for retry)`);
       return false;
     }
-    logRefusal(`${tag}	unmapped: no map line and no project names this repo`);
-    return true;
+    const spooledAt = item.created ? Date.parse(item.created) : Number.NaN;
+    const ageDays = Number.isFinite(spooledAt) ? (Date.now() - spooledAt) / 864e5 : 0;
+    if (ageDays >= UNMAPPED_KEEP_DAYS) {
+      logRefusal(`${tag}	unmapped for ${UNMAPPED_KEEP_DAYS} days: no map line and no project names this repo; ${Math.round((we - ws) / 6e4)} min removed, not sent anywhere`);
+      return true;
+    }
+    noteOncePerMinute(`unmapped:${item.repo_key || item.cwd}`, `${tag}	unmapped: no map line and no project names this repo; kept for ${UNMAPPED_KEEP_DAYS} days in case one is added`);
+    return false;
   }
   const projectId = resolved.id;
   if (resolved.status === "completed") {
@@ -1153,8 +1230,21 @@ async function deliver(item, cfg, projectsCache = {}) {
       continue;
     }
     const outcome = await postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we);
-    if (outcome === "kept") settled = false;
-    else done.add(`${segStart}|${segEnd}`);
+    if (outcome === "kept") {
+      settled = false;
+      continue;
+    }
+    if (outcome === "final") {
+      const report = await reportDrop(item, cfg, "post_refused", Math.max(0, Math.round((Date.now() - ws) / 864e5)), [segStart, segEnd]);
+      if (report.contacted) item.contacted = true;
+      if (!report.reported) {
+        logRefusal(`${tag}	${segStart}..${segEnd} was refused for good; the server could not be told it is lost (${report.why}), kept until it can`);
+        settled = false;
+        continue;
+      }
+      logRefusal(`${tag}	${segStart}..${segEnd} was refused for good: not logged, and reported`);
+    }
+    done.add(`${segStart}|${segEnd}`);
   }
   item.done = [...done].sort();
   return settled;
@@ -1315,7 +1405,7 @@ async function foldRun(item, cfg, projectId, tag, coverage, ws, we) {
         tiny.push([a, b]);
         continue;
       }
-      const outcome = await postSegment(item, cfg, projectId, tag, a, b, ws, we);
+      const outcome = await postSegment(item, cfg, projectId, tag, a, b, ws, we, true);
       if (outcome === "kept") {
         settled = false;
         continue;
@@ -1355,7 +1445,8 @@ function isWhole(segments, ws, we) {
   const only = segments.length === 1 ? segments[0] : void 0;
   return only !== void 0 && Date.parse(only[0]) === ws && Date.parse(only[1]) === we;
 }
-async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we) {
+var OVERLAP_RETRIES = 3;
+async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we, held = false) {
   let start = segStart;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const whole = Date.parse(start) === ws && Date.parse(segEnd) === we;
@@ -1373,6 +1464,7 @@ async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we) 
       agent_wait_min: meters?.waitMin,
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : void 0,
       backfilled: item.backfilled === true,
+      held,
       // A split run's tokens cannot be apportioned to one of its segments;
       // only the whole run carries them.
       agent_tokens: whole ? item.agent_tokens : void 0
@@ -1407,6 +1499,10 @@ async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we) 
     if (isFinalRefusal(res.status)) {
       if (res.status === 400 && (item.tries ?? 0) < 1) {
         logRefusal(`${tag}	400 on the first attempt, kept for one retry	${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
+        return "kept";
+      }
+      if (res.status === 409 && (item.tries ?? 0) < OVERLAP_RETRIES) {
+        logRefusal(`${tag}	409 overlap, kept: the next sweep posts only what coverage shows is uncovered	${res.text.replace(/\s+/g, " ").slice(0, 300)}`);
         return "kept";
       }
       logRefusal(`${tag}	${res.status}	${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
@@ -1448,10 +1544,19 @@ function coerceSpoolItem(value) {
 }
 var MAX_TRIES = 20;
 var PRUNE_AFTER_DAYS = 30;
+var UNMAPPED_KEEP_DAYS = 30;
+var STALE_SESSION_DAYS = 7;
 var DROP_REPORT_PATH = "/api/v1/entries/dropped";
 var DROP_GIVE_UP_DAYS = 90;
 var DROP_GIVE_UP_ATTEMPTS = 3;
 var REPO_KEY_SHAPE = /^(?!\.{1,2}\/)[a-z0-9._-]+\/[a-z0-9._-]+$/;
+function mayNameRepo(item) {
+  try {
+    return item.repo_key !== null && item.repo_key !== void 0 && REPO_KEY_SHAPE.test(item.repo_key) && resolveFromMap(readMapFile(), item.repo_key) !== null;
+  } catch {
+    return false;
+  }
+}
 async function reportDrop(item, cfg, reason, keptDays, stretch) {
   if (!cfg.apiKey) return { reported: false, contacted: false, why: "no credential" };
   const res = await http("POST", `${cfg.apiUrl}${DROP_REPORT_PATH}`, {
@@ -1460,7 +1565,7 @@ async function reportDrop(item, cfg, reason, keptDays, stretch) {
     session: item.session,
     body: {
       agent_label: item.label.slice(0, 64),
-      repo_key: item.repo_key && REPO_KEY_SHAPE.test(item.repo_key) ? item.repo_key : void 0,
+      repo_key: mayNameRepo(item) ? item.repo_key ?? void 0 : void 0,
       // A stretch of the run, when only that was lost: the whole run's window
       // on a report about ninety seconds of it overstated the loss by hours.
       start_time: stretch ? stretch[0] : item.start_time,
@@ -1975,7 +2080,88 @@ function upgradeRequiredNotice(agent = "claude") {
   const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins." : "Run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature.";
   return `Shyre is refusing hook ${VERSION} as too old${state.minVersion ? ` (it needs ${state.minVersion} or newer)` : ""}, since ${state.since}. Nothing is lost if you update within ${DROP_GIVE_UP_DAYS} days: every run is kept on this machine and is delivered after the update. ${how} Tell the person.`;
 }
+function salvageStaleSessions(cfg, now = Date.now()) {
+  const dir = sessionsDir();
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  const bases = /* @__PURE__ */ new Map();
+  for (const name of names) {
+    const base = name.endsWith(".meta.json") ? name.slice(0, -".meta.json".length) : name.endsWith(".marks") ? name.slice(0, -".marks".length) : null;
+    try {
+      const mtime = lstatSync(join(dir, name)).mtimeMs;
+      if (base === null) {
+        if (mtime < now - PRUNE_AFTER_DAYS * 864e5) unlinkSync(join(dir, name));
+        continue;
+      }
+      bases.set(base, Math.max(bases.get(base) ?? 0, mtime));
+    } catch {
+    }
+  }
+  let spooledRuns = 0;
+  for (const [name, newest] of bases) {
+    if (newest >= now - STALE_SESSION_DAYS * 864e5) continue;
+    const base = join(dir, name);
+    const remove = () => {
+      for (const ext of [".marks", ".meta.json"]) {
+        try {
+          unlinkSync(`${base}${ext}`);
+        } catch {
+        }
+      }
+    };
+    let marksText;
+    try {
+      marksText = readFileSync(`${base}.marks`, "utf8");
+    } catch (err) {
+      if (isRecord(err) && err.code === "ENOENT") {
+        remove();
+      } else {
+        logRefusal(`${name}	stale session: the marks could not be read (${errorMessage(err)}); left in place`);
+      }
+      continue;
+    }
+    const runs = segmentRuns(parseMarks(marksText), cfg.idleCapSeconds);
+    const minutes = Math.round(runs.reduce((n, r) => n + (Date.parse(r.end) - Date.parse(r.start)), 0) / 6e4);
+    const agentName = name.slice(0, name.indexOf("-"));
+    let meta = null;
+    try {
+      const parsed = JSON.parse(readFileSync(`${base}.meta.json`, "utf8"));
+      if (isAgent(agentName)) meta = coerceMeta(parsed, agentName, name.slice(agentName.length + 1));
+    } catch {
+      meta = null;
+    }
+    if (!meta) {
+      if (newest < now - PRUNE_AFTER_DAYS * 864e5) {
+        logRefusal(`${name}	stale session with no readable header: ${minutes} min of marks removed after ${PRUNE_AFTER_DAYS} days, never sent`);
+        remove();
+      } else if (runs.length > 0) {
+        noteOncePerMinute(`orphan:${name}`, `${name}	stale session with no readable header: ${minutes} min of marks kept until ${PRUNE_AFTER_DAYS} days old`);
+      }
+      continue;
+    }
+    if (meta.repoKey === null && meta.cwd) meta.repoKey = repoKeyFromRemote(gitRemote(meta.cwd));
+    try {
+      spoolRuns(meta.agent, base, meta, runs);
+    } catch (err) {
+      logRefusal(`${name}	stale session: could not spool ${runs.length} run(s) (${errorMessage(err)}); marks left in place`);
+      continue;
+    }
+    spooledRuns += runs.length;
+    logRefusal(`${name}	session never ended: ${runs.length} run(s), ${minutes} min spooled from its marks`);
+    remove();
+  }
+  return spooledRuns;
+}
 async function cmdFlush(cfg, deps = {}) {
+  try {
+    salvageStaleSessions(cfg);
+  } catch (err) {
+    logRefusal(`stale sessions could not be swept: ${errorMessage(err)}`);
+  }
   const dir = spoolDir();
   let probed = false;
   if (cfg.apiKey) {
@@ -1986,7 +2172,6 @@ async function cmdFlush(cfg, deps = {}) {
   }
   const cache = {};
   const dayAgo = Date.now() - 86400 * 1e3;
-  const weekAgo = Date.now() - 7 * 86400 * 1e3;
   const pruneBefore = Date.now() - PRUNE_AFTER_DAYS * 86400 * 1e3;
   const giveUpBefore = Date.now() - DROP_GIVE_UP_DAYS * 86400 * 1e3;
   for (const name of readdirSync(dir)) {
@@ -2027,12 +2212,20 @@ async function cmdFlush(cfg, deps = {}) {
         }
         continue;
       }
+      if (!item.created) {
+        item.created = new Date(stat.mtimeMs).toISOString();
+        try {
+          writeAtomic(path, JSON.stringify({ ...isRecord(parsed) ? parsed : {}, created: item.created }), 384);
+        } catch (err) {
+          logRefusal(`${name}	could not stamp a creation time (${errorMessage(err)}); it keeps the older retry cap`);
+        }
+      }
       const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
       const age = Number.isFinite(createdMs) ? createdMs : stat.mtimeMs;
       const windowElapsed = age < pruneBefore && (item.tries ?? 0) >= 1;
       if (windowElapsed || !item.created && (item.tries ?? 0) >= MAX_TRIES) {
         if (!(isRecord(parsed) && parsed.drop_reported === true) && await deliver(item, cfg, cache)) {
-          logRefusal(`${name}	delivered on the last attempt before it would have been dropped`);
+          logRefusal(`${name}	settled on the last attempt before it would have been reported as dropped`);
           try {
             unlinkSync(path);
           } catch (err) {
@@ -2091,7 +2284,7 @@ async function cmdFlush(cfg, deps = {}) {
         if (item.contacted) item.tries = (item.tries ?? 0) + 1;
         if (JSON.stringify({ done: item.done ?? [], tries: item.tries ?? 0 }) !== before) {
           try {
-            if (existsSync(path)) writeAtomic(path, JSON.stringify({ ...JSON.parse(text), done: item.done, tries: item.tries }), 384);
+            if (existsSync(path)) writeAtomic(path, JSON.stringify({ ...JSON.parse(text), ...item.created ? { created: item.created } : {}, done: item.done, tries: item.tries }), 384);
           } catch (err) {
             logRefusal(`${name}	could not record the sweep's result: ${errorMessage(err)}`);
           }
@@ -2103,17 +2296,6 @@ async function cmdFlush(cfg, deps = {}) {
         continue;
       }
       logRefusal(`${name}	delivery threw, kept for retry: ${errorMessage(err)}`);
-    }
-  }
-  const sessions = sessionsDir();
-  for (const name of readdirSync(sessions)) {
-    const path = join(sessions, name);
-    try {
-      if (statSync(path).mtimeMs < weekAgo) {
-        if (name.endsWith(".meta.json")) logRefusal(`${name}	pruned: session never ended, marks discarded`);
-        unlinkSync(path);
-      }
-    } catch {
     }
   }
   if (probed) maybeUpdateClaudePlugin(cfg, deps.pluginUpdate);
@@ -2453,9 +2635,17 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
     if (!newest) return "latest: unknown \u2014 no sweep has asked the server yet, and no marketplace clone was found";
     return isNewerVersion(newest.version, VERSION) ? `latest: ${newest.version} (per ${newest.source}) \u2014 this copy is ${VERSION}; see plugin-update and self-update above, or run /plugin update shyre@theshyre` : `latest: this copy (${VERSION}) is the newest anything here knows of`;
   });
-  attempt("server", () => {
+  attempt("log", () => {
+    const target = refusalLogPath();
+    try {
+      if (lstatSync(target).isSymbolicLink()) return `log: ${target} is a SYMLINK \u2014 the hook does not write through links, so nothing is being logged; replace it with a file, or point SHYRE_HOOK_LOG at one under the Shyre home`;
+    } catch {
+    }
+    return `log: ${target}`;
+  });
+  attempt("version-check", () => {
     const state = readUpgradeRequiredState();
-    return state ? `server: REFUSING this runtime (${VERSION}) as too old${state.minVersion ? ` \u2014 needs ${state.minVersion} or newer` : ""}, since ${state.since}; runs are kept and deliver after the update` : `server: accepts this runtime (${VERSION}), as far as the last answer says`;
+    return state ? `version-check: the server is REFUSING this runtime (${VERSION}) as too old${state.minVersion ? ` \u2014 needs ${state.minVersion} or newer` : ""}, since ${state.since}; runs are kept and deliver after the update` : `version-check: the server accepts this runtime (${VERSION}), as far as the last answer says`;
   });
   attempt("install id", () => {
     const id = installId();
@@ -2481,7 +2671,7 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
       const rows = res.status === 200 ? toProjectRows(res.json) : null;
       if (rows) {
         const hit = repoKey ? rows.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === repoKey) : void 0;
-        lines.push(`server: ${res.status}, ${rows.length} project(s)${repoKey ? `; ${hit ? `github_repo names this repo \u2192 ${hit.id}` : "NO project's github_repo names this repo \u2014 sessions here will be kept, then pruned"}` : ""}`);
+        lines.push(`server: ${res.status}, ${rows.length} project(s)${repoKey ? `; ${hit ? `github_repo names this repo \u2192 ${hit.id}` : "NO project's github_repo names this repo \u2014 runs from here are kept ${UNMAPPED_KEEP_DAYS} days in case a map line is added, then removed without being sent"}` : ""}`);
       } else {
         lines.push(`server: ${res.status === 401 ? "401 \u2014 the token is refused (revoked, expired, offboarded, or the team's integrations are off); re-mint it" : `${res.status || "no network"} \u2014 ${res.text.replace(/\s+/g, " ").slice(0, 120)}`}`);
       }
@@ -2495,7 +2685,7 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
     const dir = spoolDir();
     const spoolItems = readdirSync(dir).filter((n) => n.endsWith(".json"));
     const oldest = spoolItems.reduce((acc, n) => Math.min(acc, statSync(join(dir, n)).mtimeMs), Date.now());
-    return `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest ${Math.round((Date.now() - oldest) / 36e5)} h; pruned after 7 days once tried)` : ""}`;
+    return `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest touched ${Math.round((Date.now() - oldest) / 36e5)} h ago; a run that was tried is kept ${PRUNE_AFTER_DAYS} days, gets one more delivery, and is reported to the server before it is dropped)` : ""}`;
   });
   attempt("sessions", () => {
     const dir = sessionsDir();
@@ -2771,7 +2961,7 @@ if (invokedDirectly()) {
 `);
       process.exitCode = 1;
     } else {
-      logRefusal(`internal: ${err instanceof Error ? err.stack || message : message}`);
+      noteOncePerMinute("internal", `internal: ${err instanceof Error ? err.stack || message : message}`);
     }
   }).finally(() => {
     if (!interactive) process.exitCode = 0;
@@ -2795,16 +2985,20 @@ export {
   MAX_IDLE_CAP_SECONDS,
   MAX_TRIES,
   OPEN_SESSION_STALE_MS,
+  OVERLAP_RETRIES,
   PLUGIN_UPDATE_INTERVAL_MS,
   POST_INSTALL_NOTES,
   PROMPT_MARKS_MAX,
   PRUNE_AFTER_DAYS,
+  REFUSAL_LOG_MAX_BYTES,
   SELF_UPDATE_INTERVAL_MS,
   SELF_UPDATE_MAX_BYTES,
   SELF_UPDATE_PENDING_RETRY_MS,
   SIGNED_RELEASE_BASE,
+  STALE_SESSION_DAYS,
   STDIN_MAX_BYTES,
   TOKEN_REFUSAL_NOTICE_THRESHOLD,
+  UNMAPPED_KEEP_DAYS,
   VERSION,
   autoUpdateNotice,
   autoUpdateState,
@@ -2872,6 +3066,7 @@ export {
   refusalLogPath,
   repoKeyFromRemote,
   resolveFromMap,
+  salvageStaleSessions,
   scrapeSessionTokens,
   segmentRuns,
   selfUpdateNotice,

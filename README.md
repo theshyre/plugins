@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.10.0 (2026-09-17) — see `CHANGELOG.md`.
+**Latest release:** 1.10.1 (2026-09-17) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -30,7 +30,9 @@ written `autoUpdate: false` for the marketplace, an administrator's managed
 settings included. `node …/shyre-hook.mjs doctor` shows whether it is on and
 what it last did.
 
-Codex installs the same plugin from the same marketplace:
+The Codex CLI installs the same plugin from the same marketplace (Codex
+inside the VS Code extension cannot approve hooks, so sessions there are not
+recorded):
 
 ```bash
 codex plugin marketplace add theshyre/plugins

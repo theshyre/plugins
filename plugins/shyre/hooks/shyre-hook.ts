@@ -99,28 +99,33 @@
  */
 
 import { spawn, spawnSync, execFileSync } from "node:child_process";
-import { createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
 import {
-  appendFileSync,
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.10.0";
+export const VERSION = "1.10.1";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -294,6 +299,8 @@ export interface EntryBodyInput {
   agent_wait_min?: number | undefined;
   prompt_marks?: string[] | undefined;
   backfilled?: boolean | undefined;
+  /** Posted because nothing was logged beside it within the day's hold (1.9.1) — said in the description, so an entry that turns up a day late on a day already reviewed explains itself. */
+  held?: boolean | undefined;
   agent_tokens?: AgentTokens | undefined;
 }
 
@@ -551,9 +558,14 @@ export function buildEntryBody(item: EntryBodyInput): EntryBody {
     project_id: item.project_id,
     start_time: item.start_time,
     end_time: item.end_time,
+    // A description can end up on an invoice line a client reads, so it says
+    // what the time IS and nothing about where to look ("see transcript" sent
+    // a client looking for something they cannot see).
     description: item.backfilled
       ? `${item.label} session — backfilled from local history after the fact; active time (idle gaps excluded)`
-      : `${item.label} session — active time (idle gaps excluded); see transcript`,
+      : item.held
+        ? `${item.label} session — active time (idle gaps excluded); recorded a day later because no entry was logged for it`
+        : `${item.label} session — active time (idle gaps excluded)`,
     agent_label: item.label,
     session_ref: item.session_ref,
     idempotency_key: item.idempotency_key,
@@ -720,7 +732,11 @@ function ensureDir(p: string): string {
 function ensurePrivateDir(p: string): string {
   mkdirSync(p, { recursive: true, mode: 0o700 });
   try {
-    chmodSync(p, 0o700);
+    // Tightened only when it is a real directory that others can reach: a
+    // symlinked directory's TARGET is not ours to chmod, and a home someone
+    // made read-only on purpose (0500) stays that way.
+    const st = lstatSync(p);
+    if (st.isDirectory() && (st.mode & 0o077) !== 0) chmodSync(p, 0o700);
   } catch {
     /* not every filesystem honors modes */
   }
@@ -779,8 +795,30 @@ function spoolDir(): string {
 }
 
 function stateBase(agent: string, session: string): string {
-  const safe = String(session).replace(/[^A-Za-z0-9._-]/g, "_");
+  const flat = String(session).replace(/[^A-Za-z0-9._-]/g, "_");
+  // A name the filesystem can hold. A 10 KB session id was ENAMETOOLONG on
+  // every beat — never recorded, and an 11 KB stack in the log each time. Past
+  // a sane length the name is the head of the id plus a hash of all of it, so
+  // two long ids still get two files.
+  const safe = flat.length <= 120 ? flat : `${flat.slice(0, 80)}-${createHash("sha256").update(String(session)).digest("hex").slice(0, 24)}`;
   return join(sessionsDir(), `${agent}-${safe}`);
+}
+
+/**
+ * Append one line, never through a symlink. `~/.shyre` is the user's own, but
+ * `SHYRE_HOME` can be set by a repository's environment file, and a link
+ * planted at a marks file or at the log made every beat an append to whatever
+ * it pointed at (and chmod'd the target 0600). O_NOFOLLOW refuses the link;
+ * the caller's catch treats that like any other unwritable file.
+ */
+function appendLine(path: string, line: string): void {
+  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0);
+  const fd = openSync(path, flags, 0o600);
+  try {
+    writeSync(fd, line);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -798,19 +836,31 @@ export function refusalLogPath(env: Env = process.env): string {
   return target.startsWith(`${home}${sep}`) ? target : fallback;
 }
 
+/** One line of the log, at most. */
+const REFUSAL_LINE_MAX = 2_000;
+/** The log is kept, not grown forever: past this it becomes `.1` (one generation). */
+export const REFUSAL_LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+function rotateRefusalLog(target: string): void {
+  try {
+    const st = lstatSync(target);
+    if (st.isFile() && st.size > REFUSAL_LOG_MAX_BYTES) renameSync(target, `${target}.1`);
+  } catch {
+    /* no log yet */
+  }
+}
+
 export function logRefusal(line: string): void {
   try {
     const target = refusalLogPath();
     ensureDir(join(target, ".."));
     // One record per line: a field a repository controls (its remote, its
     // directory, the server's text) cannot forge a second line.
-    const flat = line.replace(/[\r\n]+/g, " ");
-    appendFileSync(target, `${new Date().toISOString()}\t${flat}\n`);
-    try {
-      chmodSync(target, 0o600);
-    } catch {
-      /* not every filesystem honors modes */
-    }
+    // Bounded per line: a stack trace with a 10 KB path in it was an 11 KB
+    // line on every beat.
+    const flat = line.replace(/[\r\n]+/g, " ").slice(0, REFUSAL_LINE_MAX);
+    rotateRefusalLog(target);
+    appendLine(target, `${new Date().toISOString()}\t${flat}\n`);
   } catch {
     /* logging must never throw */
   }
@@ -823,7 +873,12 @@ export function logRefusal(line: string): void {
  */
 function noteOncePerMinute(subject: string, line: string): void {
   try {
-    const marker = join(ensurePrivateDir(shyreHome()), `.said-${subject}`);
+    // The subject becomes a file name, so it is made one: a repository key or
+    // a path in it (`unmapped:owner/repo`) pointed the marker at a directory
+    // that does not exist, the write threw, and the line was never said.
+    const flat = subject.replace(/[^A-Za-z0-9._-]/g, "_");
+    const safe = flat.length <= 80 ? flat : `${flat.slice(0, 48)}-${createHash("sha256").update(subject).digest("hex").slice(0, 24)}`;
+    const marker = join(ensurePrivateDir(shyreHome()), `.said-${safe}`);
     const last = modeOf(marker) === undefined ? 0 : statSync(marker).mtimeMs;
     if (Date.now() - last < 60_000) return;
     writeFileSync(marker, "", { mode: 0o600 });
@@ -1124,10 +1179,69 @@ function nowIso(): string {
 /** More than this is not a hook payload; the runtime needs a session id and a directory. */
 export const STDIN_MAX_BYTES = 4 * 1024 * 1024;
 
+/** How long a hook waits for its payload. A host that never writes one must not hold the hook past its budget. */
+const STDIN_WAIT_MS = 1_000;
+
+/**
+ * The payload, read to the end — however late it arrives.
+ *
+ * ⚠️ NEVER `process.stdin.isTTY`, AND NEVER ONE `readFileSync(0)`. Touching
+ * `process.stdin` puts the pipe in non-blocking mode, and a single read then
+ * throws EAGAIN unless the whole payload is already in the pipe. A host that
+ * wrote it twenty milliseconds late — a loaded machine, a slower host, a
+ * payload in two chunks — lost that mark, and a late `end` lost the session's
+ * final stretch (measured 2026-09-17: 100 ms late → nothing recorded, one
+ * "not JSON … EAGAIN" line). So: ask the descriptor what it is, and read in a
+ * loop that waits out EAGAIN, bounded by STDIN_WAIT_MS.
+ */
+function readStdinText(): string {
+  let kind: ReturnType<typeof fstatSync>;
+  try {
+    kind = fstatSync(0);
+  } catch {
+    return ""; // stdin closed
+  }
+  if (kind.isCharacterDevice()) return ""; // a terminal: run by hand, no payload
+  // NON-BLOCKING, so the deadline below is real: a host that never closes
+  // the pipe would hold a blocking read until the hook's timeout. Node has no
+  // fcntl, and opening /dev/stdin with O_NONBLOCK shares fd 0's description on
+  // macOS and stays blocking (measured). What does work is what used to happen
+  // here by accident: initializing `process.stdin` on a pipe puts the
+  // descriptor in non-blocking mode. Done on purpose now, and the EAGAIN it
+  // causes is waited out below instead of being mistaken for "not JSON".
+  void process.stdin.isTTY;
+  const fd = 0;
+  const chunks: Buffer[] = [];
+  const buf = Buffer.allocUnsafe(64 * 1024);
+  const deadline = Date.now() + STDIN_WAIT_MS;
+  let total = 0;
+  for (;;) {
+    let n: number;
+    try {
+      n = readSync(fd, buf, 0, buf.length, null);
+    } catch (err) {
+      const code = isRecord(err) ? err.code : undefined;
+      if (code === "EAGAIN" || code === "EWOULDBLOCK") {
+        if (Date.now() >= deadline) break;
+        // A real sleep, not a spin: the hook runs on every tool call.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        continue;
+      }
+      if (code === "EOF") break;
+      throw err;
+    }
+    if (n === 0) break;
+    total += n;
+    // Past the limit the rest is drained, not kept: the caller refuses it by size.
+    if (total <= STDIN_MAX_BYTES + buf.length) chunks.push(Buffer.from(buf.subarray(0, n)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function readStdin(): unknown {
   try {
-    if (process.stdin.isTTY) return {};
-    const text = readFileSync(0, "utf8");
+    // A byte-order mark is not JSON, and some hosts on Windows send one.
+    const text = readStdinText().replace(/^\uFEFF/, "");
     if (text.length > STDIN_MAX_BYTES) {
       noteOncePerMinute("stdin-size", `payload of ${text.length} bytes ignored: larger than ${STDIN_MAX_BYTES}`);
       return {};
@@ -1180,7 +1294,7 @@ export function cmdStart(argvAgent: string, payload: unknown, announce = false):
     };
     writeAtomic(`${base}.meta.json`, JSON.stringify(meta), 0o600);
   }
-  appendFileSync(`${base}.marks`, `${nowIso()} start\n`, { mode: 0o600 });
+  appendLine(`${base}.marks`, `${nowIso()} start\n`);
   // SessionStart stdout is added to the agent's context; this is how the
   // person finds out a newer runtime exists without watching a marketplace.
   // Only on the real SessionStart — a beat that creates state lazily is a
@@ -1220,7 +1334,7 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: P
   if (!existsSync(`${base}.meta.json`)) cmdStart(agent, payload);
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
   const now = Date.now();
-  appendFileSync(`${base}.marks`, `${isoSeconds(now)} ${k}\n`, { mode: 0o600 });
+  appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}\n`);
   try {
     // 0 is the whole escape hatch: no cut of any kind, every run waits for
     // session end, exactly as before 1.6.0.
@@ -1348,7 +1462,17 @@ export function checkpoint(agent: string, base: string, meta: Meta, capSeconds: 
   // hidden: the next cut re-spools the same starts with longer windows, and
   // the coverage check trims them to what did not land.
   try {
-    writeAtomic(`${base}.marks`, remainder.map((m) => `${isoSeconds(m.t)} ${m.k}\n`).join(""), 0o600);
+    // Re-read NOW: parallel hooks (PostToolUse fires per tool call, and tool
+    // calls run in parallel) appended while the runs above were being written
+    // to disk, and a rewrite from the first read threw those marks away. The
+    // window left is this read to the rename — microseconds, not a spool.
+    let latest = remainder;
+    try {
+      latest = [...parseMarks(readFileSync(`${base}.marks`, "utf8"))].sort((a, b) => a.t - b.t).filter((m) => m.t >= cut);
+    } catch {
+      latest = remainder;
+    }
+    writeAtomic(`${base}.marks`, latest.map((m) => `${isoSeconds(m.t)} ${m.k}\n`).join(""), 0o600);
   } catch (err) {
     logRefusal(`${basename(base)}\tcheckpoint spooled ${runs.length} run(s) but could not rewrite the marks (${errorMessage(err)}); they will be re-spooled under the same keys`);
   }
@@ -1540,7 +1664,15 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
   let marksText = "";
   try {
     marksText = readFileSync(`${base}.marks`, "utf8");
-  } catch {
+  } catch (err) {
+    // ONLY "there is no marks file" is an empty session. Any other failure —
+    // EMFILE or EIO under a heavy build — used to read as empty too, and the
+    // unlink below then deleted a session's marks unread. Left in place: the
+    // stale-session sweep spools them.
+    if (!(isRecord(err) && err.code === "ENOENT")) {
+      logRefusal(`${basename(base)}\tsession end could not read the marks (${errorMessage(err)}); left in place for the next sweep`);
+      return;
+    }
     marksText = "";
   }
   const runs = segmentRuns(parseMarks(marksText), idleCapSeconds);
@@ -1833,8 +1965,20 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
       logRefusal(`${tag}\tthe project this repo maps to is ${resolved.status}: nothing logged; point ~/.shyre/projects.json at the work in flight (kept for retry)`);
       return false;
     }
-    logRefusal(`${tag}\tunmapped: no map line and no project names this repo`);
-    return true;
+    // KEPT, as `doctor` has always said ("kept, then pruned"): it used to be
+    // deleted on the first sweep, so someone who read that, added the map line
+    // and expected their week back had already lost it. Kept for
+    // UNMAPPED_KEEP_DAYS from when it was spooled, then removed with a line in
+    // the local log — and NOT reported to the server: a repository nobody
+    // mapped is often one nobody wants Shyre to hear about.
+    const spooledAt = item.created ? Date.parse(item.created) : Number.NaN;
+    const ageDays = Number.isFinite(spooledAt) ? (Date.now() - spooledAt) / 86_400_000 : 0;
+    if (ageDays >= UNMAPPED_KEEP_DAYS) {
+      logRefusal(`${tag}\tunmapped for ${UNMAPPED_KEEP_DAYS} days: no map line and no project names this repo; ${Math.round((we - ws) / 60000)} min removed, not sent anywhere`);
+      return true;
+    }
+    noteOncePerMinute(`unmapped:${item.repo_key || item.cwd}`, `${tag}\tunmapped: no map line and no project names this repo; kept for ${UNMAPPED_KEEP_DAYS} days in case one is added`);
+    return false;
   }
   const projectId = resolved.id;
   if (resolved.status === "completed") {
@@ -1889,8 +2033,25 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
       continue;
     }
     const outcome = await postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we);
-    if (outcome === "kept") settled = false;
-    else done.add(`${segStart}|${segEnd}`);
+    if (outcome === "kept") {
+      settled = false;
+      continue;
+    }
+    if (outcome === "final") {
+      // Refused for good — a closed period, above all. The fold path has said
+      // so to the server since 1.9.1; post mode and backfills settled the
+      // stretch with a line in the local log and nothing else (1.10.1). Same
+      // rule now: told with the stretch's own window, kept until it is heard.
+      const report = await reportDrop(item, cfg, "post_refused", Math.max(0, Math.round((Date.now() - ws) / 86_400_000)), [segStart, segEnd]);
+      if (report.contacted) item.contacted = true;
+      if (!report.reported) {
+        logRefusal(`${tag}\t${segStart}..${segEnd} was refused for good; the server could not be told it is lost (${report.why}), kept until it can`);
+        settled = false;
+        continue;
+      }
+      logRefusal(`${tag}\t${segStart}..${segEnd} was refused for good: not logged, and reported`);
+    }
+    done.add(`${segStart}|${segEnd}`);
   }
   item.done = [...done].sort();
   return settled;
@@ -2137,7 +2298,7 @@ async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: str
         tiny.push([a, b]);
         continue;
       }
-      const outcome = await postSegment(item, cfg, projectId, tag, a, b, ws, we);
+      const outcome = await postSegment(item, cfg, projectId, tag, a, b, ws, we, true);
       if (outcome === "kept") {
         settled = false;
         continue;
@@ -2188,6 +2349,16 @@ function isWhole(segments: readonly Segment[], ws: number, we: number): boolean 
 }
 
 type SegmentOutcome = "posted" | "final" | "kept";
+/**
+ * How many sweeps an overlap (409) is kept before it is called lost. A 409 is
+ * raised for ANY overlap, partial ones included: three hours whose last ten
+ * minutes are covered is refused whole. Settling that as "already on the
+ * books" lost the other two hours fifty (review 2026-09-17). Kept instead: the
+ * next sweep reads coverage again and posts only what is uncovered, under a
+ * new key. If it still overlaps after this many answered sweeps, something
+ * else is wrong, and the stretch is reported like any other final refusal.
+ */
+export const OVERLAP_RETRIES = 3;
 
 /**
  * Post one window of a run. A partial window carries meters recomputed from
@@ -2197,7 +2368,7 @@ type SegmentOutcome = "posted" | "final" | "kept";
  * satisfy. The whole run keeps the meters it was spooled with, so a runtime
  * that never re-meters still posts what segmentRuns computed.
  */
-async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag: string, segStart: string, segEnd: string, ws: number, we: number): Promise<SegmentOutcome> {
+async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag: string, segStart: string, segEnd: string, ws: number, we: number, held = false): Promise<SegmentOutcome> {
   let start = segStart;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const whole = Date.parse(start) === ws && Date.parse(segEnd) === we;
@@ -2215,6 +2386,7 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
       agent_wait_min: meters?.waitMin,
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : undefined,
       backfilled: item.backfilled === true,
+      held,
       // A split run's tokens cannot be apportioned to one of its segments;
       // only the whole run carries them.
       agent_tokens: whole ? item.agent_tokens : undefined,
@@ -2259,6 +2431,10 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
         logRefusal(`${tag}\t400 on the first attempt, kept for one retry\t${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
         return "kept";
       }
+      if (res.status === 409 && (item.tries ?? 0) < OVERLAP_RETRIES) {
+        logRefusal(`${tag}\t409 overlap, kept: the next sweep posts only what coverage shows is uncovered\t${res.text.replace(/\s+/g, " ").slice(0, 300)}`);
+        return "kept";
+      }
       logRefusal(`${tag}\t${res.status}\t${res.text.replace(/\s+/g, " ").slice(0, 400)}`);
       return "final";
     }
@@ -2275,7 +2451,7 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
  * why). The five fields that name the entry — session, window, key — must be
  * strings; everything else falls back. A file that parsed but has no usable
  * window is not "unreadable": it is kept for the next sweep and for the
- * seven-day prune, never deleted on sight.
+ * thirty-day prune, never deleted on sight.
  */
 function coerceSpoolItem(value: unknown): SpoolItem | null {
   if (!isRecord(value)) return null;
@@ -2318,6 +2494,10 @@ export const MAX_TRIES = 20;
  *  lost a week of hours to an outage that outlasted it; a stale file costs
  *  nothing. The marketing copy and the guide name this number. */
 export const PRUNE_AFTER_DAYS = 30;
+/** How long a run from a repository no project names is kept, in case a map line is added. */
+export const UNMAPPED_KEEP_DAYS = 30;
+/** A session whose files nobody has touched for this long never ended; its marks are spooled, not discarded. */
+export const STALE_SESSION_DAYS = 7;
 /** Where the runtime tells the server it is giving up on a run, so the drop
  *  reaches the token owner's activity list and not only this machine's log. */
 export const DROP_REPORT_PATH = "/api/v1/entries/dropped";
@@ -2352,6 +2532,23 @@ export type DropReason = "retry_window_elapsed" | "retry_cap_reached" | "no_entr
  * a 200 that is a sign-in page. The caller keeps the file for all of them,
  * bounded by DROP_GIVE_UP_DAYS.
  */
+/**
+ * Whether a drop report may name the repository. Only when the person's own
+ * map file names it: that is an explicit "Shyre tracks this one". A run from a
+ * repository nothing maps is promised never to be reported by name — and a
+ * run whose lookup FAILED (an outage, an account with no projects yet) cannot
+ * be told from one, so at day thirty it used to be reported with its
+ * repository anyway (review 2026-09-17). The report still carries the window,
+ * the label and the reason; it just does not say where.
+ */
+function mayNameRepo(item: SpoolItem): boolean {
+  try {
+    return item.repo_key !== null && item.repo_key !== undefined && REPO_KEY_SHAPE.test(item.repo_key) && resolveFromMap(readMapFile(), item.repo_key) !== null;
+  } catch {
+    return false;
+  }
+}
+
 async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, keptDays: number, stretch?: Segment): Promise<{ reported: boolean; contacted: boolean; why: string }> {
   if (!cfg.apiKey) return { reported: false, contacted: false, why: "no credential" };
   const res = await http("POST", `${cfg.apiUrl}${DROP_REPORT_PATH}`, {
@@ -2360,7 +2557,7 @@ async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, kept
     session: item.session,
     body: {
       agent_label: item.label.slice(0, 64),
-      repo_key: item.repo_key && REPO_KEY_SHAPE.test(item.repo_key) ? item.repo_key : undefined,
+      repo_key: mayNameRepo(item) ? (item.repo_key ?? undefined) : undefined,
       // A stretch of the run, when only that was lost: the whole run's window
       // on a report about ninety seconds of it overstated the loss by hours.
       start_time: stretch ? stretch[0] : item.start_time,
@@ -3221,7 +3418,113 @@ export function upgradeRequiredNotice(agent: Agent = "claude"): string | null {
   return `Shyre is refusing hook ${VERSION} as too old${state.minVersion ? ` (it needs ${state.minVersion} or newer)` : ""}, since ${state.since}. Nothing is lost if you update within ${DROP_GIVE_UP_DAYS} days: every run is kept on this machine and is delivered after the update. ${how} Tell the person.`;
 }
 
+/**
+ * Sessions nobody ended — a hard kill, a laptop that died, a host that never
+ * fires SessionEnd — have their marks SPOOLED, exactly as a session end would.
+ *
+ * ⚠️ THIS USED TO DELETE THEM ("pruned: session never ended, marks discarded").
+ * Nothing guaranteed those marks had been spooled: a checkpoint fires on a
+ * `stop` beat, an idle cut only when a LATER beat arrives. Three hours of one
+ * autonomous turn and a closed terminal was three hours deleted a week later,
+ * with a log line that named no minutes (audit 2026-09-17). And staleness was
+ * judged per FILE: the header is written once, so in any session older than
+ * the window the header looked stale while the marks were live — it was
+ * deleted, and the session end that followed found no header and left the
+ * marks to be deleted a week on, with no line at all.
+ *
+ * A session is stale only when the NEWEST of its files is older than
+ * STALE_SESSION_DAYS. Marks that cannot be attributed (no readable header)
+ * are kept until PRUNE_AFTER_DAYS and then removed with the minutes named.
+ */
+export function salvageStaleSessions(cfg: Pick<Config, "idleCapSeconds">, now: number = Date.now()): number {
+  const dir = sessionsDir();
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  const bases = new Map<string, number>();
+  for (const name of names) {
+    const base = name.endsWith(".meta.json") ? name.slice(0, -".meta.json".length) : name.endsWith(".marks") ? name.slice(0, -".marks".length) : null;
+    try {
+      const mtime = lstatSync(join(dir, name)).mtimeMs;
+      if (base === null) {
+        // Not a session file (a crashed write's leftover): gone after the long window.
+        if (mtime < now - PRUNE_AFTER_DAYS * 86_400_000) unlinkSync(join(dir, name));
+        continue;
+      }
+      bases.set(base, Math.max(bases.get(base) ?? 0, mtime));
+    } catch {
+      /* gone */
+    }
+  }
+  let spooledRuns = 0;
+  for (const [name, newest] of bases) {
+    if (newest >= now - STALE_SESSION_DAYS * 86_400_000) continue;
+    const base = join(dir, name);
+    const remove = (): void => {
+      for (const ext of [".marks", ".meta.json"]) {
+        try {
+          unlinkSync(`${base}${ext}`);
+        } catch {
+          /* already gone */
+        }
+      }
+    };
+    let marksText: string;
+    try {
+      marksText = readFileSync(`${base}.marks`, "utf8");
+    } catch (err) {
+      if (isRecord(err) && err.code === "ENOENT") {
+        remove(); // a header with no marks: nothing was ever at stake
+      } else {
+        logRefusal(`${name}\tstale session: the marks could not be read (${errorMessage(err)}); left in place`);
+      }
+      continue;
+    }
+    const runs = segmentRuns(parseMarks(marksText), cfg.idleCapSeconds);
+    const minutes = Math.round(runs.reduce((n, r) => n + (Date.parse(r.end) - Date.parse(r.start)), 0) / 60000);
+    const agentName = name.slice(0, name.indexOf("-"));
+    let meta: Meta | null = null;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(`${base}.meta.json`, "utf8"));
+      if (isAgent(agentName)) meta = coerceMeta(parsed, agentName, name.slice(agentName.length + 1));
+    } catch {
+      meta = null;
+    }
+    if (!meta) {
+      // Whose time, on which repository? Without the header there is no
+      // saying, and a run spooled under no repository is only "unmapped".
+      if (newest < now - PRUNE_AFTER_DAYS * 86_400_000) {
+        logRefusal(`${name}\tstale session with no readable header: ${minutes} min of marks removed after ${PRUNE_AFTER_DAYS} days, never sent`);
+        remove();
+      } else if (runs.length > 0) {
+        noteOncePerMinute(`orphan:${name}`, `${name}\tstale session with no readable header: ${minutes} min of marks kept until ${PRUNE_AFTER_DAYS} days old`);
+      }
+      continue;
+    }
+    if (meta.repoKey === null && meta.cwd) meta.repoKey = repoKeyFromRemote(gitRemote(meta.cwd));
+    try {
+      spoolRuns(meta.agent, base, meta, runs);
+    } catch (err) {
+      logRefusal(`${name}\tstale session: could not spool ${runs.length} run(s) (${errorMessage(err)}); marks left in place`);
+      continue;
+    }
+    spooledRuns += runs.length;
+    logRefusal(`${name}\tsession never ended: ${runs.length} run(s), ${minutes} min spooled from its marks`);
+    remove();
+  }
+  return spooledRuns;
+}
+
 export async function cmdFlush(cfg: Config, deps: { pluginUpdate?: PluginUpdateDeps } = {}): Promise<void> {
+  // FIRST, so what is salvaged is delivered by this same sweep.
+  try {
+    salvageStaleSessions(cfg);
+  } catch (err) {
+    logRefusal(`stale sessions could not be swept: ${errorMessage(err)}`);
+  }
   const dir = spoolDir();
   let probed = false;
   // Once per sweep, only when the sweep has a credential to deliver with —
@@ -3238,7 +3541,6 @@ export async function cmdFlush(cfg: Config, deps: { pluginUpdate?: PluginUpdateD
   }
   const cache: ProjectsCache = {};
   const dayAgo = Date.now() - 86400 * 1000;
-  const weekAgo = Date.now() - 7 * 86400 * 1000;
   const pruneBefore = Date.now() - PRUNE_AFTER_DAYS * 86400 * 1000;
   const giveUpBefore = Date.now() - DROP_GIVE_UP_DAYS * 86400 * 1000;
   for (const name of readdirSync(dir)) {
@@ -3291,6 +3593,20 @@ export async function cmdFlush(cfg: Config, deps: { pluginUpdate?: PluginUpdateD
         }
         continue;
       }
+      // An item an older runtime spooled has no `created`. Without one its
+      // only bound was MAX_TRIES — twenty sweeps, which a dead token reaches
+      // in a day — and it skipped the ninety-day give-up bound too, so a
+      // rotated token could cost it within hours, against the whole point of
+      // a 401 not being final. Stamped once, from the file's own time, and
+      // from then on it lives by the same clock as every other item.
+      if (!item.created) {
+        item.created = new Date(stat.mtimeMs).toISOString();
+        try {
+          writeAtomic(path, JSON.stringify({ ...(isRecord(parsed) ? parsed : {}), created: item.created }), 0o600);
+        } catch (err) {
+          logRefusal(`${name}\tcould not stamp a creation time (${errorMessage(err)}); it keeps the older retry cap`);
+        }
+      }
       // Pruned only after it was TRIED and kept for PRUNE_AFTER_DAYS — a
       // Friday session whose flush died with the lid, then a vacation, is
       // delivered on the first sweep back, not pruned unattempted. The age is
@@ -3310,7 +3626,7 @@ export async function cmdFlush(cfg: Config, deps: { pluginUpdate?: PluginUpdateD
         // and delete them. Told on an earlier sweep is still told; only an
         // unreported candidate gets the attempt.
         if (!(isRecord(parsed) && parsed.drop_reported === true) && (await deliver(item, cfg, cache))) {
-          logRefusal(`${name}\tdelivered on the last attempt before it would have been dropped`);
+          logRefusal(`${name}\tsettled on the last attempt before it would have been reported as dropped`);
           try {
             unlinkSync(path);
           } catch (err) {
@@ -3391,7 +3707,8 @@ export async function cmdFlush(cfg: Config, deps: { pluginUpdate?: PluginUpdateD
           // Part of the run landed, or a try is being counted. Remembered in
           // place; a failure to rewrite just means the next sweep asks again.
           try {
-            if (existsSync(path)) writeAtomic(path, JSON.stringify({ ...JSON.parse(text), done: item.done, tries: item.tries }), 0o600);
+            // `created` too: the stamp given above must survive this rewrite, which starts from the text as it was read.
+            if (existsSync(path)) writeAtomic(path, JSON.stringify({ ...JSON.parse(text), ...(item.created ? { created: item.created } : {}), done: item.done, tries: item.tries }), 0o600);
           } catch (err) {
             logRefusal(`${name}\tcould not record the sweep's result: ${errorMessage(err)}`);
           }
@@ -3405,21 +3722,6 @@ export async function cmdFlush(cfg: Config, deps: { pluginUpdate?: PluginUpdateD
       // A failure INSIDE delivery (not a parse failure, handled above): keep
       // the file, say why, and let the next sweep try again.
       logRefusal(`${name}\tdelivery threw, kept for retry: ${errorMessage(err)}`);
-    }
-  }
-  // Sessions nobody ended — a hard kill, a beat that arrived after the end
-  // and recreated state — would otherwise sit forever. A week is long past
-  // any live session.
-  const sessions = sessionsDir();
-  for (const name of readdirSync(sessions)) {
-    const path = join(sessions, name);
-    try {
-      if (statSync(path).mtimeMs < weekAgo) {
-        if (name.endsWith(".meta.json")) logRefusal(`${name}\tpruned: session never ended, marks discarded`);
-        unlinkSync(path);
-      }
-    } catch {
-      /* gone */
     }
   }
   // LAST, after everything is delivered: Claude Code's updater can take
@@ -3858,11 +4160,20 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
       ? `latest: ${newest.version} (per ${newest.source}) — this copy is ${VERSION}; see plugin-update and self-update above, or run /plugin update shyre@theshyre`
       : `latest: this copy (${VERSION}) is the newest anything here knows of`;
   });
-  attempt("server", () => {
+  attempt("log", () => {
+    const target = refusalLogPath();
+    try {
+      if (lstatSync(target).isSymbolicLink()) return `log: ${target} is a SYMLINK — the hook does not write through links, so nothing is being logged; replace it with a file, or point SHYRE_HOOK_LOG at one under the Shyre home`;
+    } catch {
+      /* no log yet */
+    }
+    return `log: ${target}`;
+  });
+  attempt("version-check", () => {
     const state = readUpgradeRequiredState();
     return state
-      ? `server: REFUSING this runtime (${VERSION}) as too old${state.minVersion ? ` — needs ${state.minVersion} or newer` : ""}, since ${state.since}; runs are kept and deliver after the update`
-      : `server: accepts this runtime (${VERSION}), as far as the last answer says`;
+      ? `version-check: the server is REFUSING this runtime (${VERSION}) as too old${state.minVersion ? ` — needs ${state.minVersion} or newer` : ""}, since ${state.since}; runs are kept and deliver after the update`
+      : `version-check: the server accepts this runtime (${VERSION}), as far as the last answer says`;
   });
   attempt("install id", () => {
     const id = installId();
@@ -3892,7 +4203,7 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
       const rows = res.status === 200 ? toProjectRows(res.json) : null;
       if (rows) {
         const hit = repoKey ? rows.find((p) => p.github_repo !== null && p.github_repo.toLowerCase() === repoKey) : undefined;
-        lines.push(`server: ${res.status}, ${rows.length} project(s)${repoKey ? `; ${hit ? `github_repo names this repo → ${hit.id}` : "NO project's github_repo names this repo — sessions here will be kept, then pruned"}` : ""}`);
+        lines.push(`server: ${res.status}, ${rows.length} project(s)${repoKey ? `; ${hit ? `github_repo names this repo → ${hit.id}` : "NO project's github_repo names this repo — runs from here are kept ${UNMAPPED_KEEP_DAYS} days in case a map line is added, then removed without being sent"}` : ""}`);
       } else {
         lines.push(`server: ${res.status === 401 ? "401 — the token is refused (revoked, expired, offboarded, or the team's integrations are off); re-mint it" : `${res.status || "no network"} — ${res.text.replace(/\s+/g, " ").slice(0, 120)}`}`);
       }
@@ -3906,7 +4217,7 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
     const dir = spoolDir();
     const spoolItems = readdirSync(dir).filter((n) => n.endsWith(".json"));
     const oldest = spoolItems.reduce((acc, n) => Math.min(acc, statSync(join(dir, n)).mtimeMs), Date.now());
-    return `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest ${Math.round((Date.now() - oldest) / 3600000)} h; pruned after 7 days once tried)` : ""}`;
+    return `spool: ${spoolItems.length} pending${spoolItems.length ? ` (oldest touched ${Math.round((Date.now() - oldest) / 3600000)} h ago; a run that was tried is kept ${PRUNE_AFTER_DAYS} days, gets one more delivery, and is reported to the server before it is dropped)` : ""}`;
   });
   attempt("sessions", () => {
     const dir = sessionsDir();
@@ -4299,7 +4610,8 @@ if (invokedDirectly()) {
         process.exitCode = 1;
       } else {
         // A hook must never fail the session: record it, exit 0.
-        logRefusal(`internal: ${err instanceof Error ? err.stack || message : message}`);
+        // Once a minute: an error that happens on every beat happens on every tool call.
+        noteOncePerMinute("internal", `internal: ${err instanceof Error ? err.stack || message : message}`);
       }
     })
     .finally(() => {
