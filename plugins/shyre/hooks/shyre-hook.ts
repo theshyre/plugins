@@ -116,7 +116,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.9.0";
+export const VERSION = "1.9.1";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -1810,6 +1810,8 @@ export const FOLD_SLACK_MS = 60 * 1000;
  *  session may log the neighboring unit after this one ended — before it is
  *  reported as dropped. */
 export const FOLD_HOLD_HOURS = 24;
+/** A held stretch shorter than this is not posted as its own entry when the hold ends; it is reported. */
+export const HELD_POST_MIN_SECONDS = 120;
 
 /** The entry an uncovered stretch extends, and which edge moves. */
 export interface FoldTarget {
@@ -1903,8 +1905,9 @@ export function sessionStillOpen(agent: string, sessionId: string, nowMs: number
  * A stretch with nothing to extend is held for the next sweep, and after
  * FOLD_HOLD_HOURS — counted from when this machine first spooled the run,
  * not from the run's end, so a laptop that was offline for two days still
- * gets its day — it is reported as dropped once and settled, never posted
- * blind. Coverage that cannot be read keeps the run: folding without seeing
+ * gets its day — it is posted as an entry of its own (1.9.1; 1.9.0 dropped
+ * it, which lost every minute of a session that never logged its unit). Only
+ * stretches under HELD_POST_MIN_SECONDS are reported as dropped. Coverage that cannot be read keeps the run: folding without seeing
  * the entries is guessing.
  */
 async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: string, coverage: Coverage, ws: number, we: number): Promise<boolean> {
@@ -2000,17 +2003,60 @@ async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: str
       logRefusal(`${tag}\t${minutes} min have no agent entry on this project to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
       return false;
     }
-    const report = await reportDrop(item, cfg, "no_entry_to_fold_into", Math.max(0, Math.round((Date.now() - ws) / 86_400_000)));
-    if (report.contacted) item.contacted = true;
-    if (!report.reported) {
-      logRefusal(`${tag}\t${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h; the server could not be told (${report.why}), kept until it can`);
-      return false;
+    // THE HOLD IS A DELAY, NOT A DROP (1.9.1). 1.9.0 reported these stretches
+    // as dropped once the day was up. On a host whose model never logs its
+    // own time (Codex ignores MCP instructions), or for any session that ends
+    // without logging its unit, that was every minute of the session — its
+    // owner's own 87 minutes went that way the evening after 1.9.0 shipped.
+    // The day's hold still does what it was for: a parallel session logs the
+    // neighboring entry and the stretch folds. What nobody logged within the
+    // day is posted as an entry of its own, which is what it is.
+    const tiny: Segment[] = [];
+    for (const [a, b] of unplaced) {
+      if (Date.parse(b) - Date.parse(a) < HELD_POST_MIN_SECONDS * 1000) {
+        tiny.push([a, b]);
+        continue;
+      }
+      const outcome = await postSegment(item, cfg, projectId, tag, a, b, ws, we);
+      if (outcome === "kept") {
+        settled = false;
+        continue;
+      }
+      const stretchMin = Math.round((Date.parse(b) - Date.parse(a)) / 60000);
+      if (outcome === "final") {
+        // Refused for good — a closed period, above all: these hours are
+        // lost, and a line in a log file on this laptop is not telling
+        // anyone. (postSegment's first-400 retry cannot help here: a held
+        // item has been tried many times by now.) Said to the server with
+        // the stretch's own window, and KEPT until the server records it;
+        // the re-post on the next sweep is refused again and is harmless.
+        const report = await reportDrop(item, cfg, "post_refused", Math.max(0, Math.round((Date.now() - ws) / 86_400_000)), [a, b]);
+        if (report.contacted) item.contacted = true;
+        if (!report.reported) {
+          logRefusal(`${tag}\t${stretchMin} min (${a}..${b}) were refused as an entry of their own; the server could not be told they are lost (${report.why}), kept until it can`);
+          settled = false;
+          continue;
+        }
+        logRefusal(`${tag}\t${stretchMin} min (${a}..${b}) were refused as an entry of their own: not logged, and reported`);
+      } else {
+        logRefusal(`${tag}\t${stretchMin} min (${a}..${b}) found nothing to fold into in ${FOLD_HOLD_HOURS} h: posted as an entry of their own`);
+      }
+      done.add(`${a}|${b}`);
     }
-    // Reported once: those stretches are settled, and a later sweep of this
-    // item (kept for another stretch's retry) does not report them again.
-    for (const [a, b] of unplaced) done.add(`${a}|${b}`);
     item.done = [...done].sort();
-    logRefusal(`${tag}\t${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h: not logged, and reported`);
+    const tinyMs = tiny.reduce((n, [a, b]) => n + (Date.parse(b) - Date.parse(a)), 0);
+    if (tinyMs >= 60 * 1000) {
+      // Stretches too short to be an entry of their own are still said, once.
+      const report = await reportDrop(item, cfg, "no_entry_to_fold_into", Math.max(0, Math.round((Date.now() - ws) / 86_400_000)));
+      if (report.contacted) item.contacted = true;
+      if (!report.reported) {
+        logRefusal(`${tag}\t${Math.round(tinyMs / 60000)} min in stretches under ${HELD_POST_MIN_SECONDS / 60} min found nothing to fold into in ${FOLD_HOLD_HOURS} h; the server could not be told (${report.why}), kept until it can`);
+        return false;
+      }
+      logRefusal(`${tag}\t${Math.round(tinyMs / 60000)} min in stretches under ${HELD_POST_MIN_SECONDS / 60} min found nothing to fold into in ${FOLD_HOLD_HOURS} h: not logged, and reported`);
+    }
+    for (const [a, b] of tiny) done.add(`${a}|${b}`);
+    item.done = [...done].sort();
   }
   return settled;
 }
@@ -2170,7 +2216,7 @@ export const DROP_GIVE_UP_ATTEMPTS = 3;
  *  ("/Users/…/client-secret", "file:///…", a network share) is a working
  *  directory by another name, which the payload promise says never leaves. */
 const REPO_KEY_SHAPE = /^(?!\.{1,2}\/)[a-z0-9._-]+\/[a-z0-9._-]+$/;
-export type DropReason = "retry_window_elapsed" | "retry_cap_reached" | "no_entry_to_fold_into";
+export type DropReason = "retry_window_elapsed" | "retry_cap_reached" | "no_entry_to_fold_into" | "post_refused";
 
 /**
  * Tell the server a run is about to be dropped. Sent BEFORE the delete:
@@ -2186,7 +2232,7 @@ export type DropReason = "retry_window_elapsed" | "retry_cap_reached" | "no_entr
  * a 200 that is a sign-in page. The caller keeps the file for all of them,
  * bounded by DROP_GIVE_UP_DAYS.
  */
-async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, keptDays: number): Promise<{ reported: boolean; contacted: boolean; why: string }> {
+async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, keptDays: number, stretch?: Segment): Promise<{ reported: boolean; contacted: boolean; why: string }> {
   if (!cfg.apiKey) return { reported: false, contacted: false, why: "no credential" };
   const res = await http("POST", `${cfg.apiUrl}${DROP_REPORT_PATH}`, {
     apiKey: cfg.apiKey,
@@ -2195,10 +2241,12 @@ async function reportDrop(item: SpoolItem, cfg: Config, reason: DropReason, kept
     body: {
       agent_label: item.label.slice(0, 64),
       repo_key: item.repo_key && REPO_KEY_SHAPE.test(item.repo_key) ? item.repo_key : undefined,
-      start_time: item.start_time,
-      end_time: item.end_time,
+      // A stretch of the run, when only that was lost: the whole run's window
+      // on a report about ninety seconds of it overstated the loss by hours.
+      start_time: stretch ? stretch[0] : item.start_time,
+      end_time: stretch ? stretch[1] : item.end_time,
       session_ref: item.session_ref.slice(0, 128),
-      idempotency_key: item.idempotency_key.slice(0, 128),
+      idempotency_key: (stretch ? `${item.session}:${stretch[0]}` : item.idempotency_key).slice(0, 128),
       tries: item.tries ?? 0,
       kept_days: Math.max(0, keptDays),
       reason,

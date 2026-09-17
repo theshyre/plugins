@@ -119,7 +119,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.9.0";
+var VERSION = "1.9.1";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -1119,6 +1119,7 @@ function buildFoldBody(item, segStart, segEnd, whole) {
 }
 var FOLD_SLACK_MS = 60 * 1e3;
 var FOLD_HOLD_HOURS = 24;
+var HELD_POST_MIN_SECONDS = 120;
 function foldTargets(entries, projectId, segStart, segEnd) {
   if (!Array.isArray(entries)) return [];
   const s = Date.parse(segStart);
@@ -1245,15 +1246,45 @@ async function foldRun(item, cfg, projectId, tag, coverage, ws, we) {
       logRefusal(`${tag}	${minutes} min have no agent entry on this project to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
       return false;
     }
-    const report = await reportDrop(item, cfg, "no_entry_to_fold_into", Math.max(0, Math.round((Date.now() - ws) / 864e5)));
-    if (report.contacted) item.contacted = true;
-    if (!report.reported) {
-      logRefusal(`${tag}	${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h; the server could not be told (${report.why}), kept until it can`);
-      return false;
+    const tiny = [];
+    for (const [a, b] of unplaced) {
+      if (Date.parse(b) - Date.parse(a) < HELD_POST_MIN_SECONDS * 1e3) {
+        tiny.push([a, b]);
+        continue;
+      }
+      const outcome = await postSegment(item, cfg, projectId, tag, a, b, ws, we);
+      if (outcome === "kept") {
+        settled = false;
+        continue;
+      }
+      const stretchMin = Math.round((Date.parse(b) - Date.parse(a)) / 6e4);
+      if (outcome === "final") {
+        const report = await reportDrop(item, cfg, "post_refused", Math.max(0, Math.round((Date.now() - ws) / 864e5)), [a, b]);
+        if (report.contacted) item.contacted = true;
+        if (!report.reported) {
+          logRefusal(`${tag}	${stretchMin} min (${a}..${b}) were refused as an entry of their own; the server could not be told they are lost (${report.why}), kept until it can`);
+          settled = false;
+          continue;
+        }
+        logRefusal(`${tag}	${stretchMin} min (${a}..${b}) were refused as an entry of their own: not logged, and reported`);
+      } else {
+        logRefusal(`${tag}	${stretchMin} min (${a}..${b}) found nothing to fold into in ${FOLD_HOLD_HOURS} h: posted as an entry of their own`);
+      }
+      done.add(`${a}|${b}`);
     }
-    for (const [a, b] of unplaced) done.add(`${a}|${b}`);
     item.done = [...done].sort();
-    logRefusal(`${tag}	${minutes} min found nothing to fold into in ${FOLD_HOLD_HOURS} h: not logged, and reported`);
+    const tinyMs = tiny.reduce((n, [a, b]) => n + (Date.parse(b) - Date.parse(a)), 0);
+    if (tinyMs >= 60 * 1e3) {
+      const report = await reportDrop(item, cfg, "no_entry_to_fold_into", Math.max(0, Math.round((Date.now() - ws) / 864e5)));
+      if (report.contacted) item.contacted = true;
+      if (!report.reported) {
+        logRefusal(`${tag}	${Math.round(tinyMs / 6e4)} min in stretches under ${HELD_POST_MIN_SECONDS / 60} min found nothing to fold into in ${FOLD_HOLD_HOURS} h; the server could not be told (${report.why}), kept until it can`);
+        return false;
+      }
+      logRefusal(`${tag}	${Math.round(tinyMs / 6e4)} min in stretches under ${HELD_POST_MIN_SECONDS / 60} min found nothing to fold into in ${FOLD_HOLD_HOURS} h: not logged, and reported`);
+    }
+    for (const [a, b] of tiny) done.add(`${a}|${b}`);
+    item.done = [...done].sort();
   }
   return settled;
 }
@@ -1358,7 +1389,7 @@ var DROP_REPORT_PATH = "/api/v1/entries/dropped";
 var DROP_GIVE_UP_DAYS = 90;
 var DROP_GIVE_UP_ATTEMPTS = 3;
 var REPO_KEY_SHAPE = /^(?!\.{1,2}\/)[a-z0-9._-]+\/[a-z0-9._-]+$/;
-async function reportDrop(item, cfg, reason, keptDays) {
+async function reportDrop(item, cfg, reason, keptDays, stretch) {
   if (!cfg.apiKey) return { reported: false, contacted: false, why: "no credential" };
   const res = await http("POST", `${cfg.apiUrl}${DROP_REPORT_PATH}`, {
     apiKey: cfg.apiKey,
@@ -1367,10 +1398,12 @@ async function reportDrop(item, cfg, reason, keptDays) {
     body: {
       agent_label: item.label.slice(0, 64),
       repo_key: item.repo_key && REPO_KEY_SHAPE.test(item.repo_key) ? item.repo_key : void 0,
-      start_time: item.start_time,
-      end_time: item.end_time,
+      // A stretch of the run, when only that was lost: the whole run's window
+      // on a report about ninety seconds of it overstated the loss by hours.
+      start_time: stretch ? stretch[0] : item.start_time,
+      end_time: stretch ? stretch[1] : item.end_time,
       session_ref: item.session_ref.slice(0, 128),
-      idempotency_key: item.idempotency_key.slice(0, 128),
+      idempotency_key: (stretch ? `${item.session}:${stretch[0]}` : item.idempotency_key).slice(0, 128),
       tries: item.tries ?? 0,
       kept_days: Math.max(0, keptDays),
       reason
@@ -2259,6 +2292,7 @@ export {
   DROP_REPORT_PATH,
   FOLD_HOLD_HOURS,
   FOLD_SLACK_MS,
+  HELD_POST_MIN_SECONDS,
   HOOK_WIRING,
   MAX_IDLE_CAP_SECONDS,
   MAX_TRIES,

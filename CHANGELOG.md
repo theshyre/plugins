@@ -4,6 +4,23 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.9.1 — 2026-09-17
+
+- **The day's hold is a delay, not a drop.** 1.9.0 held a stretch with no
+  agent entry beside it for a day and then reported it as dropped. For a
+  session that ended without logging its unit — or any session on a host whose
+  model never logs its own time — that was every minute of it. Now the day
+  still gives a parallel session time to log the entry the stretch folds into,
+  and what nobody logged by then is **posted as an entry of its own**. Only a
+  stretch under two minutes is still reported as dropped. If you are on 1.9.0,
+  update within a day of any session you did not log by hand.
+- **A refused late entry is said, not swallowed.** When the server refuses
+  that entry for good — the period closed in the meantime, above all — the
+  hours are lost, and the runtime tells the server so with the stretch's own
+  window (`post_refused`), keeping the run until the server has recorded it.
+  It shows in your activity list beside the refusal that says why. Needs the
+  Shyre server from 2026-09-17 or later (shyre.io already runs it).
+
 ## 1.9.0 — 2026-09-16
 
 - **No more "session — active time" entries.** The hook used to post each

@@ -5,7 +5,7 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.9.0 (2026-09-16) — see `../../CHANGELOG.md`.
+**Latest release:** 1.9.1 (2026-09-17) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
@@ -53,8 +53,8 @@ What ships:
   — at session end, and along the way: a run that ends at an idle gap is
   delivered at once, and an open run with more than half an hour
   undelivered is delivered when the agent's turn ends, so a day's work is in
-  Shyre while it happens. A run with no entry beside it waits a day, then is
-  reported as dropped; `SHYRE_HOOK_MODE=post` restores posting entries. It is built from `hooks/shyre-hook.ts`, the
+  Shyre while it happens. A run with no entry beside it waits a day for one, then is
+  posted as an entry of its own (1.9.1 — 1.9.0 dropped it); `SHYRE_HOOK_MODE=post` posts without the wait. It is built from `hooks/shyre-hook.ts`, the
   TypeScript source shipped beside it; the artifact is one plain JavaScript
   file with no dependencies, because a hook runs as a bare `node` command.
 - `.mcp.json` — the Shyre MCP server. No key in it: the agent signs in

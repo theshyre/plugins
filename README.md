@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.9.0 (2026-09-16) — see `CHANGELOG.md`.
+**Latest release:** 1.9.1 (2026-09-17) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -43,8 +43,8 @@ first so one set of hooks runs.
   once, and an open run with more than half an hour undelivered is
   delivered when the agent's turn ends — so a day's work is in Shyre while
   it happens, and never as a stack of uncategorized "session" entries. A
-  stretch with no entry beside it waits a day for one, then is reported as
-  dropped.
+  stretch with no entry beside it waits a day for one, then is posted as an
+  entry of its own, so time nobody logged is never lost.
 - **Tokens ride along.** When Claude Code's metrics exporter is on, the
   session's token counts, model and list-price estimate travel with the last
   run. Absent is absent, never zero.
