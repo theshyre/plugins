@@ -7,21 +7,25 @@
 // Edit the TypeScript source; this file is overwritten on every build.
 
 // plugins/shyre/hooks/shyre-hook.ts
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
+import { createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 /*!
@@ -119,7 +123,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.9.1";
+var VERSION = "1.10.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -208,7 +212,10 @@ function readConfig(env = process.env) {
     idleCapSeconds: Number.isFinite(cap) && cap > 0 && cap <= MAX_IDLE_CAP_SECONDS ? cap : 900,
     // 0 is a real answer (off); anything unreadable or negative is the default.
     checkpointSeconds: Number.isFinite(checkpoint2) && checkpoint2 >= 0 && checkpoint2 <= MAX_IDLE_CAP_SECONDS ? Math.floor(checkpoint2) : DEFAULT_CHECKPOINT_SECONDS,
-    fold: mode.trim().toLowerCase() !== "post"
+    fold: mode.trim().toLowerCase() !== "post",
+    // false, or the string "false" someone typed by hand, is off — never
+    // silently read as on.
+    autoUpdate: !(file.auto_update === false || typeof file.auto_update === "string" && file.auto_update.trim().toLowerCase() === "false")
   };
 }
 function repoKeyFromRemote(remote) {
@@ -530,6 +537,59 @@ function readMapFileFrom() {
 function errorMessage(err) {
   return err instanceof Error ? err.message : String(err);
 }
+function upgradeRequiredPath() {
+  return join(shyreHome(), "upgrade-required.json");
+}
+function readUpgradeRequiredState() {
+  try {
+    const parsed = JSON.parse(readFileSync(upgradeRequiredPath(), "utf8"));
+    if (!isRecord(parsed) || typeof parsed.since !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(parsed.since) || typeof parsed.refused !== "string") return null;
+    if (parsed.refused !== VERSION) return null;
+    const min = typeof parsed.minVersion === "string" && /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(parsed.minVersion) ? parsed.minVersion : null;
+    return { minVersion: min, since: parsed.since, refused: parsed.refused };
+  } catch {
+    return null;
+  }
+}
+function recordUpgradeAnswer(method, status, json) {
+  const cleared = method === "POST" && status >= 200 && status < 300 && isRecord(json);
+  try {
+    if (status === 426) {
+      const named = isRecord(json) && typeof json.min_runtime_version === "string" && /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(json.min_runtime_version) ? json.min_runtime_version : null;
+      const prior = readUpgradeRequiredState();
+      writeAtomic(upgradeRequiredPath(), JSON.stringify({ minVersion: named, since: prior?.since ?? nowIso(), refused: VERSION }), 384);
+    } else if (cleared && existsSync(upgradeRequiredPath())) {
+      unlinkSync(upgradeRequiredPath());
+    }
+  } catch {
+  }
+}
+function installId(env = process.env) {
+  if (["0", "false", "no", "off"].includes((env.SHYRE_HOOK_INSTALL_ID ?? "").trim().toLowerCase())) return null;
+  try {
+    const cfgPath = join(shyreHome(), "config.json");
+    if (existsSync(cfgPath)) {
+      const file = JSON.parse(readFileSync(cfgPath, "utf8"));
+      if (isRecord(file) && file.install_id === false) return null;
+    }
+  } catch {
+  }
+  const path = join(shyreHome(), "install-id");
+  try {
+    const existing = readFileSync(path, "utf8").trim();
+    if (/^[A-Za-z0-9_-]{16,64}$/.test(existing)) return existing;
+  } catch {
+  }
+  try {
+    const made = randomBytes(16).toString("base64url");
+    ensurePrivateDir(shyreHome());
+    writeAtomic(path, `${made}
+`, 384);
+    return made;
+  } catch {
+    return null;
+  }
+}
 function tokenRefusalStatePath() {
   return join(shyreHome(), "token-refusals.json");
 }
@@ -558,6 +618,7 @@ async function http(method, url, { apiKey, agent, session, body, trackHealth = t
   if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" && url.startsWith("https:")) {
     return { status: 0, json: null, text: "refusing to send the token while NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate checks" };
   }
+  const install = installId();
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 1e4);
   try {
@@ -573,7 +634,8 @@ async function http(method, url, { apiKey, agent, session, body, trackHealth = t
         "Content-Type": "application/json",
         "X-Agent-Label": labelFor(agent),
         "X-Session-Ref": session,
-        "User-Agent": `shyre-hook/${VERSION}`
+        "User-Agent": `shyre-hook/${VERSION}`,
+        ...install ? { "X-Shyre-Install": install } : {}
       },
       body: body === void 0 ? void 0 : JSON.stringify(body)
     });
@@ -585,6 +647,7 @@ async function http(method, url, { apiKey, agent, session, body, trackHealth = t
       json = null;
     }
     if (trackHealth) recordTokenAnswer(res.status);
+    if (trackHealth) recordUpgradeAnswer(method, res.status, json);
     return { status: res.status, json, text };
   } catch (err) {
     return { status: 0, json: null, text: errorMessage(err) };
@@ -644,7 +707,7 @@ function cmdStart(argvAgent, payload, announce = false) {
   }
   appendFileSync(`${base}.marks`, `${nowIso()} start
 `, { mode: 384 });
-  const notices = announce ? [staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n) => n !== null) : [];
+  const notices = announce ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n) => n !== null) : [];
   for (const notice of notices) {
     try {
       process.stdout.write(`${notice}
@@ -986,7 +1049,7 @@ async function resolveMapped(id, item, cfg, projectsCache) {
   return (row && closedProject(row)) ?? { id, status: row?.status ?? null };
 }
 function isFinalRefusal(status) {
-  return status >= 400 && status < 500 && ![401, 408, 429].includes(status);
+  return status >= 400 && status < 500 && ![401, 408, 426, 429].includes(status);
 }
 var COVERAGE_MAX_PAGES = 10;
 var COVERAGE_PAGE_SIZE = 100;
@@ -1448,6 +1511,215 @@ async function probeLatestVersion(cfg, fetchImpl = fetch) {
     return null;
   }
 }
+var HOOK_SIGNING_PUBLIC_KEYS = [
+  // Created 2026-09-16; private half only in the publish environment's secret
+  // HOOK_SIGNING_KEY (theshyre/shyre), backup in the owner's password manager.
+  "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAFtZYlIbCBM1qI6KyVlCbnRJLioJROJq3AkKzR2uWuVs=\n-----END PUBLIC KEY-----\n",
+  // RECOVERY KEY, created 2026-09-17. Its private half was generated on the
+  // owner's machine and is held OFFLINE — never a GitHub secret, never in a
+  // workflow. It signs nothing in the normal course. It exists for the day
+  // the key above is lost or has to be withdrawn: without it, no installed
+  // copy could ever verify another release, and every machine would have to
+  // be re-installed by hand. It does NOT contain a compromise of the publish
+  // environment — whoever holds the key above and can write to
+  // theshyre/plugins ships code to every install, and no second key in this
+  // list changes that.
+  "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA9eoZd+suIgeBMUReCmieBtjJ53wRa1xovttmQCDsb/M=\n-----END PUBLIC KEY-----\n"
+];
+var SIGNED_RELEASE_BASE = "https://raw.githubusercontent.com/theshyre/plugins";
+var SELF_UPDATE_MAX_BYTES = 5 * 1024 * 1024;
+var SELF_UPDATE_INTERVAL_MS = 6 * 36e5;
+function selfUpdatePath() {
+  return join(shyreHome(), "self-update.json");
+}
+function installedRuntimePath() {
+  return join(shyreHome(), "bin", "shyre-hook.mjs");
+}
+function verifySignedRuntime(bytes, signatureBase64, publicKeyPems) {
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(signatureBase64)) return false;
+  const signature = Buffer.from(signatureBase64.trim(), "base64");
+  if (signature.length !== 64) return false;
+  return publicKeyPems.some((pem) => {
+    try {
+      if (!pem.trim()) return false;
+      const key = createPublicKey(pem);
+      return key.asymmetricKeyType === "ed25519" && verifySignature(null, bytes, key, signature);
+    } catch {
+      return false;
+    }
+  });
+}
+function readSelfUpdateState() {
+  try {
+    const parsed = JSON.parse(readFileSync(selfUpdatePath(), "utf8"));
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function selfUpdateSkipReason(cfg, deps) {
+  if (!deps.publicKeyPems.some((k) => k.trim())) return "this build carries no signing key";
+  if (deps.env.SHYRE_HOOK_AUTO_UPDATE === "0" || cfg.autoUpdate === false) return "turned off (SHYRE_HOOK_AUTO_UPDATE=0 or auto_update: false)";
+  let running;
+  let installed;
+  try {
+    if (lstatSync(deps.installedPath).isSymbolicLink()) return "the installed copy is a symlink (a development install)";
+    running = realpathSync(deps.runningPath);
+    installed = realpathSync(deps.installedPath);
+  } catch {
+    return "not an installed copy (the plugin updates through its marketplace)";
+  }
+  if (running !== installed) return "not an installed copy (the plugin updates through its marketplace)";
+  return null;
+}
+async function fetchCapped(fetchImpl, url, maxBytes) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15e3);
+  try {
+    const res = await fetchImpl(url, { signal: ctl.signal, redirect: "error", headers: { "User-Agent": `shyre-hook/${VERSION}` } });
+    if (res.status !== 200) return { status: res.status, body: null };
+    const buf = Buffer.from(await res.arrayBuffer());
+    return { status: 200, body: buf.length > maxBytes ? null : buf };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function signedRuntimeVersion(text) {
+  return /^var VERSION = "(\d+\.\d+\.\d+)";$/m.exec(text)?.[1] ?? null;
+}
+var SELF_UPDATE_PENDING_RETRY_MS = 30 * 6e4;
+function writeNewFile(path, data, mode) {
+  writeFileSync(path, data, { mode, flag: "wx" });
+}
+async function maybeSelfUpdate(cfg, deps = {}) {
+  const now = deps.now ?? Date.now();
+  const env = deps.env ?? process.env;
+  const runningVersion = deps.runningVersion ?? VERSION;
+  const keys = deps.publicKeyPems ?? HOOK_SIGNING_PUBLIC_KEYS;
+  const target = deps.installedPath ?? installedRuntimePath();
+  const record = (state) => {
+    const lastRefusedAt = state.outcome === "refused" ? new Date(now).toISOString() : readSelfUpdateState().lastRefusedAt;
+    const full = { ...state, checked: new Date(now).toISOString(), ...lastRefusedAt ? { lastRefusedAt } : {} };
+    try {
+      writeAtomic(selfUpdatePath(), JSON.stringify(full), 384);
+    } catch {
+    }
+    return full;
+  };
+  let lock = null;
+  try {
+    const skip = selfUpdateSkipReason(cfg, { publicKeyPems: keys, runningPath: deps.runningPath ?? selfPath(), installedPath: target, env });
+    if (skip) return { outcome: "skipped", why: skip };
+    const previous = readSelfUpdateState();
+    const newest = newestKnownVersion(env);
+    if (!newest || !isNewerVersion(newest.version, runningVersion)) {
+      if (previous.outcome === "refused" || previous.outcome === "pending") return record({ outcome: "current", from: runningVersion });
+      return { outcome: "current" };
+    }
+    const last = previous.checked ? Date.parse(previous.checked) : Number.NaN;
+    const lastRefused = previous.lastRefusedAt ? Date.parse(previous.lastRefusedAt) : Number.NaN;
+    if (!deps.force) {
+      if (Number.isFinite(lastRefused) && now - lastRefused < SELF_UPDATE_INTERVAL_MS) return previous;
+      if (previous.outcome === "pending" && Number.isFinite(last) && now - last < SELF_UPDATE_PENDING_RETRY_MS) return previous;
+    }
+    lock = `${target}.update.lock`;
+    try {
+      writeNewFile(lock, Buffer.from(String(process.pid)), 384);
+    } catch {
+      try {
+        if (now - statSync(lock).mtimeMs < 10 * 6e4) {
+          lock = null;
+          return { outcome: "skipped", why: "another update is in progress" };
+        }
+        renameSync(lock, `${lock}.${process.pid}.stale`);
+        unlinkSync(`${lock}.${process.pid}.stale`);
+        writeNewFile(lock, Buffer.from(String(process.pid)), 384);
+      } catch {
+        lock = null;
+        return { outcome: "skipped", why: "another update is in progress" };
+      }
+    }
+    try {
+      const dir = join(target, "..");
+      for (const name of readdirSync(dir)) {
+        if (name.startsWith(`${basename(target)}.`) && name.endsWith(".update.mjs")) unlinkSync(join(dir, name));
+      }
+    } catch {
+    }
+    const fetchImpl = deps.fetchImpl ?? fetch;
+    const url = `${SIGNED_RELEASE_BASE}/v${newest.version}/plugins/shyre/hooks/shyre-hook.mjs`;
+    const refuse = (why) => {
+      logRefusal(`self-update	${runningVersion} -> ${newest.version}	refused: ${why}`);
+      return record({ outcome: "refused", from: runningVersion, to: newest.version, why });
+    };
+    const file = await fetchCapped(fetchImpl, url, SELF_UPDATE_MAX_BYTES);
+    if (file.status === 404) {
+      return record({ outcome: "pending", from: runningVersion, to: newest.version, why: "the signed release is not published yet" });
+    }
+    if (!file.body) return refuse("the release file could not be downloaded");
+    const sig = await fetchCapped(fetchImpl, `${url}.sig`, 1024);
+    if (!sig.body) return refuse("the release has no signature");
+    if (!verifySignedRuntime(file.body, sig.body.toString("utf8"), keys)) {
+      return refuse("the signature does not verify against this runtime's key");
+    }
+    const signedVersion = signedRuntimeVersion(file.body.toString("utf8"));
+    if (signedVersion !== newest.version || !isNewerVersion(signedVersion, runningVersion)) {
+      return refuse(`the signed file is version ${signedVersion ?? "unknown"}, not a newer ${newest.version}`);
+    }
+    const tmp = `${target}.${process.pid}.${now}.update.mjs`;
+    writeNewFile(tmp, file.body, 448);
+    const drop = () => {
+      try {
+        unlinkSync(tmp);
+      } catch {
+      }
+    };
+    const parsed = spawnSync(process.execPath, ["--check", tmp], { encoding: "utf8", timeout: 15e3 });
+    if (parsed.status !== 0) {
+      drop();
+      return refuse("Node could not parse the signed file on this machine");
+    }
+    const scratch = mkdtempSync(join(tmpdir(), "shyre-update-"));
+    const smoke = spawnSync(process.execPath, [tmp, "version"], {
+      encoding: "utf8",
+      timeout: 15e3,
+      env: { ...process.env, SHYRE_HOME: scratch, SHYRE_API_KEY: "", SHYRE_NO_DETACH: "1" }
+    });
+    rmSync(scratch, { recursive: true, force: true });
+    if (smoke.status !== 0 || smoke.stdout.trim() !== signedVersion) {
+      drop();
+      return refuse("the signed file did not start on this machine");
+    }
+    try {
+      const prev = `${target}.prev`;
+      rmSync(prev, { force: true });
+      writeNewFile(prev, readFileSync(target), 448);
+    } catch {
+    }
+    renameSync(tmp, target);
+    logRefusal(`self-update	${runningVersion} -> ${signedVersion}	updated (signature verified)`);
+    return record({ outcome: "updated", from: runningVersion, to: signedVersion, announced: false });
+  } catch (err) {
+    logRefusal(`self-update	failed: ${errorMessage(err)}`);
+    return record({ outcome: "refused", from: runningVersion, why: errorMessage(err) });
+  } finally {
+    if (lock) {
+      try {
+        if (readFileSync(lock, "utf8") === String(process.pid)) unlinkSync(lock);
+      } catch {
+      }
+    }
+  }
+}
+function selfUpdateNotice() {
+  const state = readSelfUpdateState();
+  if (state.outcome !== "updated" || state.announced !== false || !state.to) return null;
+  try {
+    writeAtomic(selfUpdatePath(), JSON.stringify({ ...state, announced: true }), 384);
+  } catch {
+  }
+  return `The Shyre hook updated itself from ${state.from ?? "an older version"} to ${state.to} (signature verified). Tell the person.`;
+}
 function newestKnownVersion(env = process.env) {
   let best = null;
   const consider = (version, source) => {
@@ -1468,6 +1740,11 @@ function newestKnownVersion(env = process.env) {
   }
   return best;
 }
+var MANAGED_SETTINGS_PATHS = [
+  "/Library/Application Support/ClaudeCode/managed-settings.json",
+  "/etc/claude-code/managed-settings.json",
+  "C:\\Program Files\\ClaudeCode\\managed-settings.json"
+];
 function claudeConfigDir(env) {
   return env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 }
@@ -1486,25 +1763,175 @@ function autoUpdateState(env = process.env, marketplace = "theshyre", cwd = proc
   if (!entry) return { known: false };
   if (entry.autoUpdate === true) return { known: true, on: true, source: "known_marketplaces.json" };
   const settingsFiles = [
-    ["/Library/Application Support/ClaudeCode/managed-settings.json", "managed settings"],
-    ["/etc/claude-code/managed-settings.json", "managed settings"],
-    [join(cwd, ".claude", "settings.local.json"), "project local settings"],
-    [join(cwd, ".claude", "settings.json"), "project settings"],
+    ...MANAGED_SETTINGS_PATHS.map((path) => [path, "managed settings"]),
+    // `cwd: null` leaves the project's files out: what a REPOSITORY says must
+    // not decide whether the plugin updates itself (a repo could otherwise
+    // switch it off, or claim Claude Code does it).
+    ...cwd === null ? [] : [[join(cwd, ".claude", "settings.local.json"), "project local settings"], [join(cwd, ".claude", "settings.json"), "project settings"]],
     [join(dir, "settings.json"), "user settings"]
   ];
+  let explicitOff = entry.autoUpdate === false ? "known_marketplaces.json" : void 0;
   for (const [path, label] of settingsFiles) {
     const settings = readJson(path);
     const extra = settings && isRecord(settings.extraKnownMarketplaces) ? settings.extraKnownMarketplaces : null;
     const mine = extra && isRecord(extra[marketplace]) ? extra[marketplace] : null;
     if (mine && mine.autoUpdate === true) return { known: true, on: true, source: label };
+    if (mine && mine.autoUpdate === false && explicitOff === void 0) explicitOff = label;
   }
-  return { known: true, on: false };
+  return explicitOff ? { known: true, on: false, explicitOff } : { known: true, on: false };
+}
+var PLUGIN_UPDATE_INTERVAL_MS = 6 * 36e5;
+var PLUGIN_UPDATE_LOCK_STALE_MS = 10 * 6e4;
+var PLUGIN_ID = "shyre@theshyre";
+function pluginUpdatePath() {
+  return join(shyreHome(), "plugin-update.json");
+}
+function readPluginUpdateState() {
+  try {
+    const parsed = JSON.parse(readFileSync(pluginUpdatePath(), "utf8"));
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function pluginUpdateSkipReason(cfg, deps) {
+  if (deps.env.SHYRE_NO_DETACH === "1") return "tests never start a real updater";
+  if (deps.env.SHYRE_HOOK_AUTO_UPDATE === "0" || cfg.autoUpdate === false) return "turned off (SHYRE_HOOK_AUTO_UPDATE=0 or auto_update: false)";
+  if (!/[\\/]plugins[\\/]cache[\\/]theshyre[\\/]shyre[\\/][^\\/]+[\\/]hooks[\\/][^\\/]+$/.test(deps.runningPath)) return "this copy was not installed from the theshyre marketplace";
+  for (const path of deps.managedPaths ?? MANAGED_SETTINGS_PATHS) {
+    const managed = readJson(path);
+    if (managed && (managed.strictKnownMarketplaces !== void 0 || managed.blockedMarketplaces !== void 0 || managed.allowManagedHooksOnly === true)) {
+      return "this machine's managed settings restrict plugins or marketplaces";
+    }
+  }
+  const state = autoUpdateState(deps.env, "theshyre", null);
+  if (!state.known) return "the theshyre marketplace is not known to Claude Code here";
+  if (state.on) return "Claude Code's own auto-update is on for the marketplace, and does this itself";
+  if (state.explicitOff) return `auto-update was turned off for the marketplace in ${state.explicitOff}`;
+  return null;
+}
+function claudeBinaryCandidates(home = homedir(), platform = process.platform) {
+  return platform === "win32" ? [join(home, ".local", "bin", "claude.exe"), join(home, "AppData", "Local", "Programs", "claude", "claude.exe")] : [join(home, ".local", "bin", "claude"), join(home, ".claude", "local", "claude"), "/opt/homebrew/bin/claude", "/usr/local/bin/claude"];
+}
+function claudeBinary() {
+  for (const candidate of claudeBinaryCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return process.platform === "win32" ? null : "claude";
+}
+function defaultRunClaude() {
+  const bin = claudeBinary();
+  return (args) => {
+    if (bin === null) return { status: null, stdout: "", missing: true };
+    const r = spawnSync(bin, [...args], { cwd: homedir(), encoding: "utf8", timeout: 18e4, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    if (r.error && "code" in r.error && r.error.code === "ENOENT") return { status: null, stdout: "", missing: true };
+    return { status: r.status, stdout: r.stdout ?? "" };
+  };
+}
+function interpretPluginUpdate(run, runningVersion) {
+  if (run.missing) return { outcome: "failed", why: "no `claude` binary could be found to run the update" };
+  let json = null;
+  for (const line of run.stdout.split("\n").reverse()) {
+    try {
+      const parsed = JSON.parse(line);
+      if (isRecord(parsed)) {
+        json = parsed;
+        break;
+      }
+    } catch {
+    }
+  }
+  if (!isRecord(json)) return { outcome: "failed", why: `the updater exited ${run.status ?? "without a status"} and printed no result` };
+  if (run.status !== 0 || json.outcome !== "ok") {
+    const code = typeof json.failureCode === "string" && /^[a-z_]{1,40}$/.test(json.failureCode) ? ` (${json.failureCode})` : "";
+    return { outcome: "failed", why: `the updater refused${code}` };
+  }
+  if (json.updateOutcome === "up_to_date") return { outcome: "current" };
+  const to = typeof json.newVersion === "string" && /^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(json.newVersion) ? json.newVersion : null;
+  if (json.updateOutcome === "updated" && to && isNewerVersion(to, runningVersion)) return { outcome: "updated", to };
+  return { outcome: "failed", why: "the updater answered with something that is not a newer version" };
+}
+function maybeUpdateClaudePlugin(cfg, deps = {}) {
+  const env = deps.env ?? process.env;
+  const now = deps.now ?? Date.now();
+  const runningVersion = deps.runningVersion ?? VERSION;
+  const record = (state) => {
+    const full = { ...state, checked: new Date(now).toISOString() };
+    try {
+      writeAtomic(pluginUpdatePath(), JSON.stringify(full), 384);
+    } catch {
+    }
+    return full;
+  };
+  let lock = null;
+  try {
+    const skip = pluginUpdateSkipReason(cfg, { env, runningPath: deps.runningPath ?? selfPath(), managedPaths: deps.managedPaths });
+    if (skip) return { outcome: "skipped", why: skip };
+    const newest = newestKnownVersion(env);
+    if (!newest || !isNewerVersion(newest.version, runningVersion)) return { outcome: "current" };
+    const previous = readPluginUpdateState();
+    if (previous.outcome === "updated" && previous.to && !isNewerVersion(newest.version, previous.to)) return previous;
+    const last = previous.checked ? Date.parse(previous.checked) : Number.NaN;
+    if (Number.isFinite(last) && last <= now && now - last < PLUGIN_UPDATE_INTERVAL_MS) return previous;
+    lock = `${pluginUpdatePath()}.lock`;
+    try {
+      writeNewFile(lock, Buffer.from(String(process.pid)), 384);
+    } catch {
+      try {
+        if (now - statSync(lock).mtimeMs < PLUGIN_UPDATE_LOCK_STALE_MS) {
+          lock = null;
+          return { outcome: "skipped", why: "another update is in progress" };
+        }
+        renameSync(lock, `${lock}.${process.pid}.stale`);
+        unlinkSync(`${lock}.${process.pid}.stale`);
+        writeNewFile(lock, Buffer.from(String(process.pid)), 384);
+      } catch {
+        lock = null;
+        return { outcome: "skipped", why: "another update is in progress" };
+      }
+    }
+    const runClaude = deps.runClaude ?? defaultRunClaude();
+    const refreshed = runClaude(["plugin", "marketplace", "update", "theshyre"]);
+    if (refreshed.missing || refreshed.status !== 0) {
+      const why = refreshed.missing ? "no `claude` binary could be found to run the update" : `the marketplace could not be refreshed (exit ${refreshed.status ?? "none"}) \u2014 no network, or no git`;
+      logRefusal(`plugin-update	${runningVersion} -> ${newest.version}	failed: ${why}`);
+      return record({ outcome: "failed", from: runningVersion, to: newest.version, why });
+    }
+    const result = interpretPluginUpdate(runClaude(["plugin", "update", PLUGIN_ID, "--json"]), runningVersion);
+    logRefusal(`plugin-update	${runningVersion} -> ${result.to ?? newest.version}	${result.outcome}${result.why ? `: ${result.why}` : ""}`);
+    return record({ ...result, from: runningVersion, ...result.outcome === "updated" ? { announced: false } : {} });
+  } catch (err) {
+    logRefusal(`plugin-update	failed: ${errorMessage(err)}`);
+    const code = isRecord(err) && typeof err.code === "string" && /^[A-Z_]{1,20}$/.test(err.code) ? err.code : "unexpected";
+    return record({ outcome: "failed", from: runningVersion, why: `an internal error (${code})` });
+  } finally {
+    if (lock) {
+      try {
+        if (readFileSync(lock, "utf8") === String(process.pid)) unlinkSync(lock);
+      } catch {
+      }
+    }
+  }
+}
+function safeWhy(why) {
+  return typeof why === "string" && /^[A-Za-z0-9 `_.,()\-—]{1,140}$/.test(why) ? why : "see ~/.shyre/refusals.log";
+}
+function pluginUpdateNotice() {
+  const state = readPluginUpdateState();
+  if (state.outcome !== "updated" || state.announced !== false || !state.to) return null;
+  if (state.to !== VERSION) return null;
+  try {
+    writeAtomic(pluginUpdatePath(), JSON.stringify({ ...state, announced: true }), 384);
+  } catch {
+  }
+  return `The Shyre plugin updated itself from ${state.from ?? "an older version"} to ${state.to}, through Claude Code's own plugin updater. To stop it doing that, set SHYRE_HOOK_AUTO_UPDATE=0. Tell the person.`;
 }
 var AUTO_UPDATE_REMINDER_MS = 24 * 60 * 60 * 1e3;
-function autoUpdateNotice(agent, env = process.env, now = Date.now(), cwd = process.cwd()) {
+function autoUpdateNotice(agent, env = process.env, now = Date.now(), cwd = process.cwd(), runningPath = selfPath()) {
   if (agent !== "claude") return null;
   const state = autoUpdateState(env, "theshyre", cwd);
   if (!state.known || state.on) return null;
+  if (pluginUpdateSkipReason(readConfig(env), { env: { ...env, SHYRE_NO_DETACH: "" }, runningPath }) === null) return null;
   const stamp = join(shyreHome(), "auto-update-reminded");
   try {
     const last = Number(readFileSync(stamp, "utf8").trim());
@@ -1517,11 +1944,23 @@ function autoUpdateNotice(agent, env = process.env, now = Date.now(), cwd = proc
   }
   return "Auto-update is off for the theshyre marketplace, so this Shyre plugin only moves when someone updates it by hand. Turn it on once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update. Tell the person; this reminder comes at most once a day.";
 }
-function staleNotice(agent = "claude", env = process.env, apiUrl = DEFAULT_API_URL) {
+function staleNotice(agent = "claude", env = process.env, apiUrl = DEFAULT_API_URL, signingKeys = HOOK_SIGNING_PUBLIC_KEYS, runningPath = selfPath()) {
   const newest = newestKnownVersion(env);
   if (!newest || !isNewerVersion(newest.version, VERSION)) return null;
   const download = `curl -fsSL ${apiUrl}/hooks/shyre-hook.mjs -o ~/.shyre/bin/shyre-hook.mjs`;
-  const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins \u2014 or turn on auto-update once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update." : agent === "codex" || agent === "cursor" ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.` : `Replace the runtime: ${download}.`;
+  const how = agent === "claude" ? pluginUpdateSkipReason(readConfig(env), { env: { ...env, SHYRE_NO_DETACH: "" }, runningPath }) === null ? (() => {
+    const last = readPluginUpdateState();
+    if (last.outcome === "updated" && last.to && isNewerVersion(last.to, VERSION) && !isNewerVersion(newest.version, last.to)) {
+      return `It already updated itself to ${last.to}; that applies at the next session \u2014 nothing to run.`;
+    }
+    if (last.outcome === "current") {
+      return "It asked Claude Code's updater, which does not see that release yet; it asks again within six hours. If this keeps being said, run /plugin update shyre@theshyre.";
+    }
+    return last.outcome === "failed" ? `It tried to update itself and could not (${safeWhy(last.why)}); run /plugin update shyre@theshyre, then /reload-plugins.` : "It updates itself through Claude Code's own updater, and the new version applies at the next session \u2014 nothing to run.";
+  })() : "Run /plugin update shyre@theshyre, then /reload-plugins \u2014 or turn on auto-update once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update." : (agent === "codex" || agent === "cursor") && selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) === null ? (() => {
+    const last = readSelfUpdateState();
+    return last.outcome === "refused" ? `The last self-update was refused (${last.why ?? "see ~/.shyre/refusals.log"}); run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature \u2014 never a bare download.` : "It replaces itself with the signed release on the next sweep; nothing to run.";
+  })() : (agent === "codex" || agent === "cursor") && /turned off/.test(selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) ?? "") ? "Self-update is turned off here; run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature \u2014 never a bare download." : agent === "codex" || agent === "cursor" ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.` : `Replace the runtime: ${download}.`;
   return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
 }
 var TOKEN_REFUSAL_NOTICE_THRESHOLD = 3;
@@ -1530,9 +1969,21 @@ function tokenRefusalNotice() {
   if (state.count < TOKEN_REFUSAL_NOTICE_THRESHOLD) return null;
   return `Shyre: the token has been refused ${state.count} times in a row since ${state.since} \u2014 re-mint it at /settings/integrations. The spooled runs are kept and will post once a working key is in place. Tell the person.`;
 }
-async function cmdFlush(cfg) {
+function upgradeRequiredNotice(agent = "claude") {
+  const state = readUpgradeRequiredState();
+  if (!state) return null;
+  const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins." : "Run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature.";
+  return `Shyre is refusing hook ${VERSION} as too old${state.minVersion ? ` (it needs ${state.minVersion} or newer)` : ""}, since ${state.since}. Nothing is lost if you update within ${DROP_GIVE_UP_DAYS} days: every run is kept on this machine and is delivered after the update. ${how} Tell the person.`;
+}
+async function cmdFlush(cfg, deps = {}) {
   const dir = spoolDir();
-  if (cfg.apiKey) await probeLatestVersion(cfg);
+  let probed = false;
+  if (cfg.apiKey) {
+    if (await probeLatestVersion(cfg) !== null) {
+      await maybeSelfUpdate(cfg);
+      probed = true;
+    }
+  }
   const cache = {};
   const dayAgo = Date.now() - 86400 * 1e3;
   const weekAgo = Date.now() - 7 * 86400 * 1e3;
@@ -1580,6 +2031,15 @@ async function cmdFlush(cfg) {
       const age = Number.isFinite(createdMs) ? createdMs : stat.mtimeMs;
       const windowElapsed = age < pruneBefore && (item.tries ?? 0) >= 1;
       if (windowElapsed || !item.created && (item.tries ?? 0) >= MAX_TRIES) {
+        if (!(isRecord(parsed) && parsed.drop_reported === true) && await deliver(item, cfg, cache)) {
+          logRefusal(`${name}	delivered on the last attempt before it would have been dropped`);
+          try {
+            unlinkSync(path);
+          } catch (err) {
+            if (err.code !== "ENOENT") throw err;
+          }
+          continue;
+        }
         const why = `kept for retry ${item.tries} time(s)${windowElapsed ? ` over ${PRUNE_AFTER_DAYS} days` : ""}`;
         if (isRecord(parsed) && parsed.drop_reported === true) {
           logRefusal(`${name}	pruned: ${why}; reported to the server on an earlier sweep`);
@@ -1656,6 +2116,7 @@ async function cmdFlush(cfg) {
     } catch {
     }
   }
+  if (probed) maybeUpdateClaudePlugin(cfg, deps.pluginUpdate);
 }
 function nodeCommand(scriptPath, agent, args) {
   if (!/^[A-Za-z0-9_./\\: -]+$/.test(scriptPath)) {
@@ -1969,6 +2430,19 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
   attempt("checkpoints", () => `checkpoints: ${cfg.checkpointSeconds > 0 ? `a stop after ${cfg.checkpointSeconds}s of unposted work posts it` : "off \u2014 every run waits for session end"}`);
+  attempt("self-update", () => {
+    const skip = selfUpdateSkipReason(cfg, { publicKeyPems: HOOK_SIGNING_PUBLIC_KEYS, runningPath: selfPath(), installedPath: installedRuntimePath(), env: process.env });
+    const state = readSelfUpdateState();
+    const last = state.outcome && state.outcome !== "current" && state.outcome !== "skipped" ? ` \u2014 last: ${state.outcome}${state.to ? ` ${state.from ?? "?"} -> ${state.to}` : ""}${state.why ? ` (${state.why})` : ""}${state.checked ? ` at ${state.checked}` : ""}` : "";
+    const rollback = state.outcome === "updated" ? ` \u2014 to go back: cp ~/.shyre/bin/shyre-hook.mjs.prev ~/.shyre/bin/shyre-hook.mjs` : "";
+    return skip ? `self-update: off \u2014 ${skip}${last}` : `self-update: on (signed releases from ${SIGNED_RELEASE_BASE})${last}${rollback}`;
+  });
+  attempt("plugin-update", () => {
+    const skip = pluginUpdateSkipReason(readConfig(), { env: { ...process.env, SHYRE_NO_DETACH: "" }, runningPath: selfPath() });
+    const state = readPluginUpdateState();
+    const last = state.outcome ? ` \u2014 last: ${state.outcome}${state.to ? ` \u2192 ${state.to}` : ""}${state.why ? ` (${state.why})` : ""}${state.checked ? ` at ${state.checked}` : ""}` : "";
+    return skip ? `plugin-update: off \u2014 ${skip}${last}` : `plugin-update: on (through Claude Code's own updater; SHYRE_HOOK_AUTO_UPDATE=0 turns it off)${last}`;
+  });
   attempt("auto-update", () => {
     const state = autoUpdateState(process.env, "theshyre", cwd);
     if (!state.known) return "auto-update: the theshyre marketplace is not known to Claude Code on this machine (a curl install, or no Claude Code)";
@@ -1977,7 +2451,15 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
   attempt("latest", () => {
     const newest = newestKnownVersion();
     if (!newest) return "latest: unknown \u2014 no sweep has asked the server yet, and no marketplace clone was found";
-    return isNewerVersion(newest.version, VERSION) ? `latest: ${newest.version} (per ${newest.source}) \u2014 this copy is ${VERSION}; run /plugin update shyre@theshyre, or enable auto-update for the theshyre marketplace` : `latest: this copy (${VERSION}) is the newest anything here knows of`;
+    return isNewerVersion(newest.version, VERSION) ? `latest: ${newest.version} (per ${newest.source}) \u2014 this copy is ${VERSION}; see plugin-update and self-update above, or run /plugin update shyre@theshyre` : `latest: this copy (${VERSION}) is the newest anything here knows of`;
+  });
+  attempt("server", () => {
+    const state = readUpgradeRequiredState();
+    return state ? `server: REFUSING this runtime (${VERSION}) as too old${state.minVersion ? ` \u2014 needs ${state.minVersion} or newer` : ""}, since ${state.since}; runs are kept and deliver after the update` : `server: accepts this runtime (${VERSION}), as far as the last answer says`;
+  });
+  attempt("install id", () => {
+    const id = installId();
+    return id ? `install id: ${id} (random; tells two machines on one account apart \u2014 SHYRE_HOOK_INSTALL_ID=0 sends none)` : "install id: none sent";
   });
   attempt("tls", () => process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0" ? "tls: WARNING: NODE_TLS_REJECT_UNAUTHORIZED=0 \u2014 the hook refuses to send the token while certificate checks are off" : "tls: certificate checks on");
   attempt("tokens", () => tokensDoctorLine(process.env));
@@ -2228,12 +2710,26 @@ async function cmdBackfill(argv, cfg) {
 `);
   await cmdFlush(cfg);
 }
-var INTERACTIVE = /* @__PURE__ */ new Set(["install", "doctor", "backfill"]);
+async function cmdUpdate(cfg) {
+  if (cfg.apiKey) await probeLatestVersion(cfg);
+  const state = await maybeSelfUpdate({ ...cfg, autoUpdate: true }, { force: true, env: { ...process.env, SHYRE_HOOK_AUTO_UPDATE: "" } });
+  const line = state.outcome === "updated" ? `updated ${state.from} -> ${state.to} (signature verified)` : state.outcome === "current" ? `already current (${VERSION})` : `not updated: ${state.why ?? state.outcome}`;
+  process.stdout.write(`shyre-hook: ${line}
+`);
+  if (state.outcome === "refused") process.exitCode = 1;
+}
+var INTERACTIVE = /* @__PURE__ */ new Set(["install", "doctor", "backfill", "update"]);
 async function main(argv) {
   const positional = argv.filter((a) => !a.startsWith("--"));
   const [first, second, third] = positional;
   const cfg = readConfig();
   if (first === "flush") return cmdFlush(cfg);
+  if (first === "version") {
+    process.stdout.write(`${VERSION}
+`);
+    return;
+  }
+  if (first === "update") return cmdUpdate(cfg);
   if (first === "doctor") return cmdDoctor(argv);
   if (first === "backfill") return cmdBackfill(argv, cfg);
   if (first === "install") {
@@ -2293,13 +2789,20 @@ export {
   FOLD_HOLD_HOURS,
   FOLD_SLACK_MS,
   HELD_POST_MIN_SECONDS,
+  HOOK_SIGNING_PUBLIC_KEYS,
   HOOK_WIRING,
+  MANAGED_SETTINGS_PATHS,
   MAX_IDLE_CAP_SECONDS,
   MAX_TRIES,
   OPEN_SESSION_STALE_MS,
+  PLUGIN_UPDATE_INTERVAL_MS,
   POST_INSTALL_NOTES,
   PROMPT_MARKS_MAX,
   PRUNE_AFTER_DAYS,
+  SELF_UPDATE_INTERVAL_MS,
+  SELF_UPDATE_MAX_BYTES,
+  SELF_UPDATE_PENDING_RETRY_MS,
+  SIGNED_RELEASE_BASE,
   STDIN_MAX_BYTES,
   TOKEN_REFUSAL_NOTICE_THRESHOLD,
   VERSION,
@@ -2309,6 +2812,7 @@ export {
   buildEntryBody,
   buildFoldBody,
   checkpoint,
+  claudeBinaryCandidates,
   claudeShapedHooks,
   closedOnTheRight,
   cmdBackfill,
@@ -2317,6 +2821,7 @@ export {
   cmdFlush,
   cmdInstall,
   cmdStart,
+  cmdUpdate,
   cursorHooks,
   deliver,
   detectAgent,
@@ -2330,7 +2835,10 @@ export {
   hooksSessionMoving,
   installCodex,
   installCursor,
+  installId,
   installOrigin,
+  installedRuntimePath,
+  interpretPluginUpdate,
   isAgent,
   isNewerVersion,
   labelSetClose,
@@ -2338,6 +2846,8 @@ export {
   main,
   mapFileCandidates,
   marksFromTranscriptEvents,
+  maybeSelfUpdate,
+  maybeUpdateClaudePlugin,
   metersFor,
   newestKnownVersion,
   nodeCommand,
@@ -2347,19 +2857,29 @@ export {
   parseSessionTokens,
   pickTranscriptEvent,
   planBackfill,
+  pluginUpdateNotice,
+  pluginUpdatePath,
+  pluginUpdateSkipReason,
   probeLatestVersion,
   prometheusPort,
   promptMarksFor,
   readConfig,
+  readPluginUpdateState,
+  readSelfUpdateState,
   readTokenRefusalState,
   readTranscriptSessions,
+  readUpgradeRequiredState,
   refusalLogPath,
   repoKeyFromRemote,
   resolveFromMap,
   scrapeSessionTokens,
   segmentRuns,
+  selfUpdateNotice,
+  selfUpdatePath,
+  selfUpdateSkipReason,
   sessionStillOpen,
   shyreHome,
+  signedRuntimeVersion,
   staleNotice,
   tokenRefusalNotice,
   tokensDoctorLine,
@@ -2367,5 +2887,7 @@ export {
   uncoveredSegments,
   uninstallCodex,
   uninstallCursor,
-  validApiUrl
+  upgradeRequiredNotice,
+  validApiUrl,
+  verifySignedRuntime
 };

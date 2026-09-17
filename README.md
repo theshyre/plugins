@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.9.1 (2026-09-17) — see `CHANGELOG.md`.
+**Latest release:** 1.10.0 (2026-09-17) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -13,12 +13,22 @@ claude plugin install shyre@theshyre
 export SHYRE_API_KEY="shyre_pat_…"   # from Settings → Integrations in Shyre
 ```
 
-That is the whole setup for Claude Code. Then turn on auto-update for the
-marketplace once — `/plugin` → **Marketplaces** → **theshyre** → **Enable
-auto-update** — so releases land on the next launch; Claude Code leaves it
-off for every marketplace that is not Anthropic's, and until you flip it the
-plugin says so at session start, once a day, and says when a newer version
-exists.
+That is the whole setup for Claude Code.
+
+**It keeps itself current, and you should know how (1.10.0).** Claude Code
+auto-updates only Anthropic's own marketplaces by default, so a plugin from
+anywhere else sits at the version you installed until you find a toggle three
+menus deep. When a newer release exists, this plugin asks **Claude Code's own
+updater** to update it — it runs `claude plugin marketplace update theshyre`
+and `claude plugin update shyre@theshyre` for you, in the background, at most
+every six hours. Nothing is downloaded by the plugin itself and no new source
+is trusted: it is the same updater pulling the same repository you installed
+from. The new version applies at your next session, which says once that it
+updated. To turn it off: `SHYRE_HOOK_AUTO_UPDATE=0`, or `"auto_update":
+false` in `~/.shyre/config.json` — and it stays off wherever anyone has
+written `autoUpdate: false` for the marketplace, an administrator's managed
+settings included. `node …/shyre-hook.mjs doctor` shows whether it is on and
+what it last did.
 
 Codex installs the same plugin from the same marketplace:
 
@@ -68,7 +78,8 @@ first so one set of hooks runs.
   from this machine's Claude Code transcripts for sessions before the plugin
   was installed — timestamps only — and logs them marked *backfilled*.
 
-Cursor, and Codex setups that predate the plugin, use the same runtime through its installer; the
+Cursor, and Codex in the VS Code extension (which does not support plugins), use the same runtime
+through its installer, and from 1.10.0 that copy replaces itself with each new signed release; the
 [agent hooks kit guide](https://shyre.io/docs/guides/features/agent-hooks-kit)
 (Shyre account required) has the commands, what gets measured, what leaves the
 machine, and how to check it is working; `plugins/shyre/README.md` here has

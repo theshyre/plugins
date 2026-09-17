@@ -4,6 +4,57 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.10.0 — 2026-09-17
+
+- **The Claude Code plugin keeps itself current.** Claude Code auto-updates
+  only Anthropic's own marketplaces by default, so this plugin sat wherever
+  you installed it until you found a toggle three menus deep. Now, when a
+  newer release exists, it asks **Claude Code's own updater** to update it
+  (`claude plugin marketplace update theshyre`, then `claude plugin update
+  shyre@theshyre`) — in the background, at most every six hours, applying at
+  your next session, which says so once. It downloads nothing itself and
+  trusts no new source. **On by default; off with `SHYRE_HOOK_AUTO_UPDATE=0`
+  or `"auto_update": false`, and wherever anyone wrote `autoUpdate: false`
+  for the marketplace** (an administrator's managed settings included). A
+  failed attempt is recorded and said; `doctor` prints `plugin-update:`.
+- **"Too old" keeps your hours.** If Shyre ever refuses this runtime as too
+  old (`426`), the run is kept — every earlier runtime deleted it, like any
+  other refusal — the next session start says which version is needed, and
+  the updated runtime delivers what was kept, for up to ninety days. Shyre
+  never sends that answer to a runtime older than this one.
+- **A month-old run gets one more delivery before it is called dropped.** The
+  sweep used to go straight to the drop report once a run had been kept thirty
+  days — so replacing a dead token on day 35 made the first sweep report your
+  hours lost and delete them. It now tries to deliver first.
+- **Two machines, two lines.** Each install now sends a random id
+  (`X-Shyre-Install`, sixteen random bytes kept in `~/.shyre/install-id`) so a
+  laptop and a desktop on one account show separately under **Settings →
+  Integrations** — a laptop whose hooks stopped is no longer hidden by a
+  desktop whose hooks did not. It names nothing about the machine;
+  `SHYRE_HOOK_INSTALL_ID=0` sends none. `doctor` prints it.
+- **Installer copies keep themselves current.** The copy the installer puts
+  at `~/.shyre/bin/shyre-hook.mjs` (Cursor, and Codex without the plugin)
+  never updated. It now replaces
+  itself, in the background, with the newest release from this repository at
+  its version tag, and only when: the Ed25519 signature verifies against a key
+  the running copy carries; the signed file is the version named and newer
+  than the running one; Node parses it; and it starts. The previous copy is
+  kept as `shyre-hook.mjs.prev`. Codex trusts a hook by its definition — the
+  event, the matcher and the command string — not by the script behind it
+  (run on Codex 0.154: the script was rewritten, the hook still fired), and
+  the command never changes, so an update does not ask you to trust anything
+  again. One limit, stated plainly: the Codex **VS Code extension** has no
+  `/hooks` command, so hooks can only be trusted from the Codex CLI; whether
+  the extension then runs them is not something we have been able to confirm.
+- **`update`**: `node ~/.shyre/bin/shyre-hook.mjs update` runs the same checks
+  now. **`version`** prints the runtime's version.
+- **Turn it off** with `SHYRE_HOOK_AUTO_UPDATE=0` or `"auto_update": false` in
+  `~/.shyre/config.json`. `doctor` shows the state on its `self-update:` line.
+- Every release from this one on ships `shyre-hook.mjs.sig`.
+
+**A copy installed before 1.10.0 cannot update itself.** Re-run the install
+once: `curl -fsSL https://shyre.io/hooks/shyre-hook.mjs -o ~/.shyre/bin/shyre-hook.mjs && node ~/.shyre/bin/shyre-hook.mjs install codex` (or `cursor`).
+
 ## 1.9.1 — 2026-09-17
 
 - **The day's hold is a delay, not a drop.** 1.9.0 held a stretch with no

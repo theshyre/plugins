@@ -5,19 +5,20 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.9.1 (2026-09-17) — see `../../CHANGELOG.md`.
+**Latest release:** 1.10.0 (2026-09-17) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
 claude plugin install shyre@theshyre
 ```
 
-Then turn on auto-update for the marketplace once — `/plugin` → **Marketplaces**
-→ **theshyre** → **Enable auto-update** — so releases land on the next
-launch. Claude Code leaves auto-update off for every marketplace that is
-not Anthropic's, and nothing a plugin ships can change that; until you flip
-it, the plugin tells the agent at session start that it is off (once a day)
-and when a newer version exists. It also says so when the token itself is
+The plugin keeps itself current (1.10.0): when a newer release exists it asks
+Claude Code's own updater to update it (`claude plugin marketplace update
+theshyre`, then `claude plugin update shyre@theshyre`), in the background, at
+most every six hours; the new version applies at the next session, which says
+so once. It fetches nothing itself and trusts no new source.
+`SHYRE_HOOK_AUTO_UPDATE=0` turns it off, and it stays off wherever someone
+wrote `autoUpdate: false` for the marketplace. It also says so when the token itself is
 the problem: `SHYRE_API_KEY` refuses with a 401 on rotation or expiry the
 same as on revocation, and a 401 never drops a spooled run — but after three
 refused deliveries in a row, session start reports how many times and since
@@ -62,7 +63,7 @@ What ships:
 - `skills/log-your-time` — how to log categorized, invoice-ready entries at
   the end of a unit of work.
 
-Cursor, and Codex without the plugin, use the same runtime through its installer:
+Cursor, and Codex without the plugin — including the Codex VS Code extension, which does not support plugins — use the same runtime through its installer. From 1.10.0 that installed copy replaces itself with each new signed release:
 
 ```
 mkdir -p ~/.shyre/bin
