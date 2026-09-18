@@ -5,12 +5,16 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.10.1 (2026-09-17) — see `../../CHANGELOG.md`.
+**Latest release:** 1.11.0 (2026-09-18) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
 claude plugin install shyre@theshyre
 ```
+
+**Requires Node.js 18 or later** (`node --version`). The hooks that record
+time are a Node.js program; without Node.js the plugin installs and its tools
+work, but nothing is recorded.
 
 The plugin keeps itself current (1.10.0): when a newer release exists it asks
 Claude Code's own updater to update it (`claude plugin marketplace update
@@ -61,7 +65,9 @@ What ships:
 - `.mcp.json` — the Shyre MCP server. No key in it: the agent signs in
   through the browser and keeps its own token.
 - `skills/log-your-time` — how to log categorized, invoice-ready entries at
-  the end of a unit of work.
+  the end of a unit of work. In Claude Code the hook prompts for it: a commit
+  with fifteen or more unlogged minutes behind it earns the agent a one-line
+  note (`SHYRE_LOG_NUDGE_MINUTES`, `0` for off).
 
 Cursor, and Codex without the plugin — including the Codex VS Code extension, which does not support plugins — use the same runtime through its installer. From 1.10.0 that installed copy replaces itself with each new signed release:
 

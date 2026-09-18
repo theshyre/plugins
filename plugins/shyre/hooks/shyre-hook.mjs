@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.10.1";
+var VERSION = "1.11.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -174,6 +174,7 @@ function isRecord(value) {
 }
 var MAX_IDLE_CAP_SECONDS = 86400;
 var DEFAULT_CHECKPOINT_SECONDS = 1800;
+var DEFAULT_NUDGE_MINUTES = 15;
 function shyreHome() {
   return process.env.SHYRE_HOME || join(homedir(), ".shyre");
 }
@@ -210,6 +211,9 @@ function readConfig(env = process.env) {
   const fileCheckpoint = typeof file.checkpoint_seconds === "number" || typeof file.checkpoint_seconds === "string" ? file.checkpoint_seconds : void 0;
   const rawCheckpoint = env.SHYRE_CHECKPOINT_SECONDS ?? fileCheckpoint;
   const checkpoint2 = rawCheckpoint === void 0 || rawCheckpoint === "" ? DEFAULT_CHECKPOINT_SECONDS : Number(rawCheckpoint);
+  const fileNudge = typeof file.log_nudge_minutes === "number" || typeof file.log_nudge_minutes === "string" ? file.log_nudge_minutes : void 0;
+  const rawNudge = env.SHYRE_LOG_NUDGE_MINUTES ?? fileNudge;
+  const nudge = rawNudge === void 0 || rawNudge === "" ? DEFAULT_NUDGE_MINUTES : Number(rawNudge);
   const mode = env.SHYRE_HOOK_MODE || (typeof file.hook_mode === "string" ? file.hook_mode : "");
   return {
     apiKey,
@@ -220,7 +224,9 @@ function readConfig(env = process.env) {
     fold: mode.trim().toLowerCase() !== "post",
     // false, or the string "false" someone typed by hand, is off — never
     // silently read as on.
-    autoUpdate: !(file.auto_update === false || typeof file.auto_update === "string" && file.auto_update.trim().toLowerCase() === "false")
+    autoUpdate: !(file.auto_update === false || typeof file.auto_update === "string" && file.auto_update.trim().toLowerCase() === "false"),
+    // 0 is a real answer (off); anything unreadable or negative is the default.
+    nudgeMinutes: Number.isFinite(nudge) && nudge >= 0 && nudge <= 1440 ? Math.floor(nudge) : DEFAULT_NUDGE_MINUTES
   };
 }
 function repoKeyFromRemote(remote) {
@@ -778,6 +784,59 @@ function cmdStart(argvAgent, payload, announce = false) {
   }
   detachedFlush();
 }
+var COMMIT_COMMAND = /\bgit\b(?:\s+-\S+(?:\s+[^\s-]\S*)?)*\s+commit\b|\bgh\s+pr\s+(?:create|merge)\b/;
+var QUOTED = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
+var ENTRIES_URL = /\/api\/v1\/entries(?=["'\s?]|$)/;
+var SENDS_A_BODY = /(?:^|\s)(?:-d|--data(?:-raw|-binary)?|--json)(?:[\s=]|$)/;
+var OTHER_METHOD = /(?:-X\s*|--request[\s=]+)["']?(?!POST\b)[A-Za-z]+/;
+function toolSignal(raw) {
+  const p = isRecord(raw) ? raw : {};
+  if (p.hook_event_name !== "PostToolUse") return null;
+  const tool = typeof p.tool_name === "string" ? p.tool_name : "";
+  if (/(?:^|_)log_time_entry$/.test(tool)) return "logged";
+  if (tool !== "Bash") return null;
+  const input = isRecord(p.tool_input) ? p.tool_input : {};
+  const command = typeof input.command === "string" ? input.command : "";
+  const bare = command.replace(QUOTED, '""');
+  if (COMMIT_COMMAND.test(bare)) return /\s--dry-run\b/.test(bare) ? null : "commit";
+  if (/\bcurl\b/.test(bare) && ENTRIES_URL.test(command) && SENDS_A_BODY.test(bare) && !OTHER_METHOD.test(bare)) return "logged";
+  return null;
+}
+function nudgeStep(state, signal, now, idleCapMs, thresholdMs) {
+  const prior = state ?? { activeMs: 0, last: now, notedAt: -1 };
+  const gap = now - prior.last;
+  const next = { activeMs: prior.activeMs + (gap > 0 && gap <= idleCapMs ? gap : 0), last: now, notedAt: prior.notedAt };
+  if (signal === "logged") return { state: { activeMs: 0, last: now, notedAt: -1 }, note: false };
+  if (signal !== "commit" || thresholdMs <= 0 || next.activeMs < thresholdMs) return { state: next, note: false };
+  if (next.notedAt >= 0 && next.activeMs - next.notedAt < thresholdMs) return { state: next, note: false };
+  return { state: { ...next, notedAt: next.activeMs }, note: true };
+}
+function nudgeNotice(minutes, thresholdMinutes) {
+  return `Shyre: a commit just landed, and about ${minutes} minutes of this session are in no time entry you have logged. If that commit ends a unit of work (planning, documents and reviews count, not only shipped code), log it now with the log-your-time skill, before you write the wrap-up. If the unit is still open, carry on: this note comes back only after another ${thresholdMinutes} minutes of work.`;
+}
+function readNudgeState(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (!isRecord(parsed)) return null;
+    const { activeMs, last, notedAt } = parsed;
+    if (typeof activeMs !== "number" || typeof last !== "number" || typeof notedAt !== "number") return null;
+    if (!Number.isFinite(activeMs) || !Number.isFinite(last) || !Number.isFinite(notedAt) || activeMs < 0) return null;
+    return { activeMs, last, notedAt };
+  } catch {
+    return null;
+  }
+}
+function logNudge(agent, session, base, payload, now, cfg) {
+  const thresholdMinutes = cfg.nudgeMinutes ?? DEFAULT_NUDGE_MINUTES;
+  if (agent !== "claude" || thresholdMinutes <= 0 || !cfg.apiKey) return null;
+  const path = `${base}.nudge.json`;
+  const prior = readNudgeState(path);
+  const step = nudgeStep(prior, toolSignal(payload), now, cfg.idleCapSeconds * 1e3, thresholdMinutes * 6e4);
+  const meta = step.note ? readMeta(base, agent, session) : null;
+  const say = step.note && meta !== null && meta.repoKey !== null;
+  writeAtomic(path, JSON.stringify(say ? step.state : { ...step.state, notedAt: prior?.notedAt ?? -1 }), 384);
+  return say ? nudgeNotice(Math.round(step.state.activeMs / 6e4), thresholdMinutes) : null;
+}
 function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
@@ -791,6 +850,13 @@ function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const now = Date.now();
   appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}
 `);
+  try {
+    const notice = logNudge(agent, session, base, payload, now, cfg);
+    if (notice !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}
+`);
+  } catch (err) {
+    noteOncePerMinute("nudge", `${agent}	log-your-time note skipped: ${errorMessage(err)}`);
+  }
   try {
     if (cfg.checkpointSeconds <= 0) return;
     const marks = parseMarks(readFileSync(`${base}.marks`, "utf8")).sort((a, b) => a.t - b.t);
@@ -1064,6 +1130,10 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
   }
   try {
     unlinkSync(`${base}.meta.json`);
+  } catch {
+  }
+  try {
+    unlinkSync(`${base}.nudge.json`);
   } catch {
   }
   if (runs.length > 0) detachedFlush();
@@ -2106,7 +2176,7 @@ function salvageStaleSessions(cfg, now = Date.now()) {
     if (newest >= now - STALE_SESSION_DAYS * 864e5) continue;
     const base = join(dir, name);
     const remove = () => {
-      for (const ext of [".marks", ".meta.json"]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json"]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {
@@ -2374,8 +2444,9 @@ function mergeHooks(existing, ours) {
 }
 var CONVENTION = `## Shyre \u2014 log your own time
 
-When you finish a substantial unit of work in a repo that is tracked in Shyre,
-log the time yourself: \`GET /api/v1/projects\` (bearer \`$SHYRE_API_KEY\`)
+When you finish a substantial unit of work in a repo that is tracked in Shyre
+(a commit the person asked for, a PR, a feature, a plan or document delivered;
+planning counts), log the time yourself, in that turn, before the wrap-up: \`GET /api/v1/projects\` (bearer \`$SHYRE_API_KEY\`)
 to find the project by its \`github_repo\` and pick a category, then
 \`POST /api/v1/entries\` with ISO-8601 start/end WITH offset, a one-line
 outcome description, \`agent_label\` naming this agent, \`session_ref\`, and an
@@ -2973,6 +3044,7 @@ export {
   COVERAGE_PAGE_SIZE,
   DEFAULT_API_URL,
   DEFAULT_CHECKPOINT_SECONDS,
+  DEFAULT_NUDGE_MINUTES,
   DROP_GIVE_UP_ATTEMPTS,
   DROP_GIVE_UP_DAYS,
   DROP_REPORT_PATH,
@@ -3036,6 +3108,7 @@ export {
   isAgent,
   isNewerVersion,
   labelSetClose,
+  logNudge,
   logRefusal,
   main,
   mapFileCandidates,
@@ -3046,6 +3119,8 @@ export {
   newestKnownVersion,
   nodeCommand,
   normalizePayload,
+  nudgeNotice,
+  nudgeStep,
   openRunStart,
   parseMarks,
   parseSessionTokens,
@@ -3078,6 +3153,7 @@ export {
   staleNotice,
   tokenRefusalNotice,
   tokensDoctorLine,
+  toolSignal,
   uncoveredMillis,
   uncoveredSegments,
   uninstallCodex,

@@ -125,7 +125,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.10.1";
+export const VERSION = "1.11.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -226,6 +226,11 @@ export interface Config {
    *  release (1.10.0). `auto_update: false` in config.json, or
    *  SHYRE_HOOK_AUTO_UPDATE=0, turns it off. Absent means on. */
   autoUpdate?: boolean;
+  /** Minutes of active, unlogged session time after which a commit earns the
+   *  agent a one-line note to log its time (1.11.0). `log_nudge_minutes` in
+   *  config.json or SHYRE_LOG_NUDGE_MINUTES; 0 turns the note off. Absent
+   *  means the default. */
+  nudgeMinutes?: number;
 }
 
 /** One queued run, as written to ~/.shyre/spool. */
@@ -343,6 +348,9 @@ export const MAX_IDLE_CAP_SECONDS = 86_400;
 /** Half an hour: long enough that a checkpoint is a real stretch of work,
  *  short enough that a day's work is visible in Shyre while it is happening. */
 export const DEFAULT_CHECKPOINT_SECONDS = 1800;
+/** A commit with fewer unlogged minutes behind it than this is not worth a
+ *  sentence in the agent's context: a quick fix is not a unit of work. */
+export const DEFAULT_NUDGE_MINUTES = 15;
 
 export function shyreHome(): string {
   return process.env.SHYRE_HOME || join(homedir(), ".shyre");
@@ -395,6 +403,9 @@ export function readConfig(env: Env = process.env): Config {
   const fileCheckpoint = typeof file.checkpoint_seconds === "number" || typeof file.checkpoint_seconds === "string" ? file.checkpoint_seconds : undefined;
   const rawCheckpoint = env.SHYRE_CHECKPOINT_SECONDS ?? fileCheckpoint;
   const checkpoint = rawCheckpoint === undefined || rawCheckpoint === "" ? DEFAULT_CHECKPOINT_SECONDS : Number(rawCheckpoint);
+  const fileNudge = typeof file.log_nudge_minutes === "number" || typeof file.log_nudge_minutes === "string" ? file.log_nudge_minutes : undefined;
+  const rawNudge = env.SHYRE_LOG_NUDGE_MINUTES ?? fileNudge;
+  const nudge = rawNudge === undefined || rawNudge === "" ? DEFAULT_NUDGE_MINUTES : Number(rawNudge);
   const mode = env.SHYRE_HOOK_MODE || (typeof file.hook_mode === "string" ? file.hook_mode : "");
   // Bounded above as well as below: a cap of 1e9 would turn elapsed span
   // into "active time", which is the one thing the meter must never do.
@@ -408,6 +419,8 @@ export function readConfig(env: Env = process.env): Config {
     // false, or the string "false" someone typed by hand, is off — never
     // silently read as on.
     autoUpdate: !(file.auto_update === false || (typeof file.auto_update === "string" && file.auto_update.trim().toLowerCase() === "false")),
+    // 0 is a real answer (off); anything unreadable or negative is the default.
+    nudgeMinutes: Number.isFinite(nudge) && nudge >= 0 && nudge <= 1440 ? Math.floor(nudge) : DEFAULT_NUDGE_MINUTES,
   };
 }
 
@@ -1312,6 +1325,122 @@ export function cmdStart(argvAgent: string, payload: unknown, announce = false):
   detachedFlush();
 }
 
+// ---------------------------------------------------------------------------
+// The log-your-time note (1.11.0)
+// ---------------------------------------------------------------------------
+//
+// Since 1.9.0 the hook posts no entry of its own while a session runs: the
+// entry a person expects to see is the AGENT's, and the agent writes it only
+// if it notices that a unit of work has ended. Nothing made it notice — a
+// 105-minute planning session ended in a commit and logged nothing until the
+// person asked where the entry was (2026-09-18). A repeated instruction is a
+// missing control; this is the control. The hook already runs after every
+// tool call, so it can see the commit, and it can count the session's
+// unlogged minutes from its own beats with no network at all.
+
+/** What a tool call means to the note: the end of a unit, or an entry written. */
+export type ToolSignal = "commit" | "logged" | null;
+
+const COMMIT_COMMAND = /\bgit\b(?:\s+-\S+(?:\s+[^\s-]\S*)?)*\s+commit\b|\bgh\s+pr\s+(?:create|merge)\b/;
+const QUOTED = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
+/** The collection itself: `/entries/<id>` is an edit and `/entries/<id>/fold` is the hook's own verb. */
+const ENTRIES_URL = /\/api\/v1\/entries(?=["'\s?]|$)/;
+const SENDS_A_BODY = /(?:^|\s)(?:-d|--data(?:-raw|-binary)?|--json)(?:[\s=]|$)/;
+const OTHER_METHOD = /(?:-X\s*|--request[\s=]+)["']?(?!POST\b)[A-Za-z]+/;
+
+/**
+ * Read one PostToolUse payload. Only the tool's NAME and, for a shell call,
+ * its command line are looked at; neither is stored or sent anywhere.
+ *
+ * A commit is looked for with quoted text removed, and wins: a commit
+ * MESSAGE that quotes `curl -X POST …/api/v1/entries` is a commit, not an
+ * entry written (reading it as one zeroed the count — review, 2026-09-18),
+ * and `echo "usage: git commit"` is neither.
+ */
+export function toolSignal(raw: unknown): ToolSignal {
+  const p = isRecord(raw) ? raw : {};
+  if (p.hook_event_name !== "PostToolUse") return null;
+  const tool = typeof p.tool_name === "string" ? p.tool_name : "";
+  // The Shyre MCP tool under any server prefix a host gives it.
+  if (/(?:^|_)log_time_entry$/.test(tool)) return "logged";
+  if (tool !== "Bash") return null;
+  const input = isRecord(p.tool_input) ? p.tool_input : {};
+  const command = typeof input.command === "string" ? input.command : "";
+  const bare = command.replace(QUOTED, '""');
+  if (COMMIT_COMMAND.test(bare)) return /\s--dry-run\b/.test(bare) ? null : "commit";
+  if (/\bcurl\b/.test(bare) && ENTRIES_URL.test(command) && SENDS_A_BODY.test(bare) && !OTHER_METHOD.test(bare)) return "logged";
+  return null;
+}
+
+/** The note's whole memory, per session: `${base}.nudge.json`. */
+export interface NudgeState {
+  /** Active milliseconds since the agent last wrote an entry. */
+  activeMs: number;
+  /** The previous beat's instant. */
+  last: number;
+  /** `activeMs` as it stood when the note was last given; -1 when never. */
+  notedAt: number;
+}
+
+/**
+ * One beat's worth of bookkeeping. A gap over the idle cap is a break and
+ * adds nothing, exactly as the meters treat it. An entry written resets the
+ * count. A commit earns the note once `thresholdMs` of unlogged time is
+ * behind it, and again only after ANOTHER threshold's worth accrues: the
+ * agent may rightly decide the unit is still open, and saying it twice is a
+ * nag.
+ */
+export function nudgeStep(state: NudgeState | null, signal: ToolSignal, now: number, idleCapMs: number, thresholdMs: number): { state: NudgeState; note: boolean } {
+  const prior = state ?? { activeMs: 0, last: now, notedAt: -1 };
+  const gap = now - prior.last;
+  const next: NudgeState = { activeMs: prior.activeMs + (gap > 0 && gap <= idleCapMs ? gap : 0), last: now, notedAt: prior.notedAt };
+  if (signal === "logged") return { state: { activeMs: 0, last: now, notedAt: -1 }, note: false };
+  if (signal !== "commit" || thresholdMs <= 0 || next.activeMs < thresholdMs) return { state: next, note: false };
+  if (next.notedAt >= 0 && next.activeMs - next.notedAt < thresholdMs) return { state: next, note: false };
+  return { state: { ...next, notedAt: next.activeMs }, note: true };
+}
+
+export function nudgeNotice(minutes: number, thresholdMinutes: number): string {
+  return `Shyre: a commit just landed, and about ${minutes} minutes of this session are in no time entry you have logged. If that commit ends a unit of work (planning, documents and reviews count, not only shipped code), log it now with the log-your-time skill, before you write the wrap-up. If the unit is still open, carry on: this note comes back only after another ${thresholdMinutes} minutes of work.`;
+}
+
+function readNudgeState(path: string): NudgeState | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!isRecord(parsed)) return null;
+    const { activeMs, last, notedAt } = parsed;
+    if (typeof activeMs !== "number" || typeof last !== "number" || typeof notedAt !== "number") return null;
+    if (!Number.isFinite(activeMs) || !Number.isFinite(last) || !Number.isFinite(notedAt) || activeMs < 0) return null;
+    return { activeMs, last, notedAt };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Advance this session's count and return the note when one is due. Claude
+ * Code only: it is the one host measured to hand a PostToolUse hook's
+ * `additionalContext` to the model, and JSON on stdout in a host that does
+ * not read it is noise in someone's terminal. A session outside any
+ * repository, or with no token to log with, has nothing to be reminded of.
+ */
+export function logNudge(agent: Agent, session: string, base: string, payload: unknown, now: number, cfg: Pick<Config, "idleCapSeconds"> & Partial<Pick<Config, "apiKey" | "nudgeMinutes">>): string | null {
+  const thresholdMinutes = cfg.nudgeMinutes ?? DEFAULT_NUDGE_MINUTES;
+  if (agent !== "claude" || thresholdMinutes <= 0 || !cfg.apiKey) return null;
+  const path = `${base}.nudge.json`;
+  // Read-modify-write with no lock: two tool calls that finish together can
+  // lose one update. Accepted — the worst case is a note a few minutes early
+  // or late, and a lock would put a wait on every tool call.
+  const prior = readNudgeState(path);
+  const step = nudgeStep(prior, toolSignal(payload), now, cfg.idleCapSeconds * 1000, thresholdMinutes * 60_000);
+  const meta = step.note ? readMeta(base, agent, session) : null;
+  const say = step.note && meta !== null && meta.repoKey !== null;
+  // A note that was not given is not remembered as given: a repository that
+  // gains its remote mid-session must not wait a second threshold.
+  writeAtomic(path, JSON.stringify(say ? step.state : { ...step.state, notedAt: prior?.notedAt ?? -1 }), 0o600);
+  return say ? nudgeNotice(Math.round(step.state.activeMs / 60_000), thresholdMinutes) : null;
+}
+
 /**
  * A beat. Creates state on the fly when SessionStart never fired.
  *
@@ -1323,7 +1452,7 @@ export function cmdStart(argvAgent: string, payload: unknown, announce = false):
  *      now, cut at this mark.
  * Either spools and kicks a detached flush; the hook itself does no network.
  */
-export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: Pick<Config, "idleCapSeconds" | "checkpointSeconds"> = readConfig()): void {
+export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: Pick<Config, "idleCapSeconds" | "checkpointSeconds"> & Partial<Pick<Config, "apiKey" | "nudgeMinutes">> = readConfig()): void {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -1335,6 +1464,12 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: P
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
   const now = Date.now();
   appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}\n`);
+  try {
+    const notice = logNudge(agent, session, base, payload, now, cfg);
+    if (notice !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}\n`);
+  } catch (err) {
+    noteOncePerMinute("nudge", `${agent}\tlog-your-time note skipped: ${errorMessage(err)}`);
+  }
   try {
     // 0 is the whole escape hatch: no cut of any kind, every run waits for
     // session end, exactly as before 1.6.0.
@@ -1739,6 +1874,11 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
     unlinkSync(`${base}.meta.json`);
   } catch {
     /* already gone */
+  }
+  try {
+    unlinkSync(`${base}.nudge.json`);
+  } catch {
+    /* never written, or already gone */
   }
   if (runs.length > 0) detachedFlush();
 }
@@ -3464,7 +3604,7 @@ export function salvageStaleSessions(cfg: Pick<Config, "idleCapSeconds">, now: n
     if (newest >= now - STALE_SESSION_DAYS * 86_400_000) continue;
     const base = join(dir, name);
     const remove = (): void => {
-      for (const ext of [".marks", ".meta.json"]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json"]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {
@@ -3865,8 +4005,9 @@ function mergeHooks(existing: Record<string, unknown>, ours: { hooks: Record<str
 
 const CONVENTION = `## Shyre — log your own time
 
-When you finish a substantial unit of work in a repo that is tracked in Shyre,
-log the time yourself: \`GET /api/v1/projects\` (bearer \`$SHYRE_API_KEY\`)
+When you finish a substantial unit of work in a repo that is tracked in Shyre
+(a commit the person asked for, a PR, a feature, a plan or document delivered;
+planning counts), log the time yourself, in that turn, before the wrap-up: \`GET /api/v1/projects\` (bearer \`$SHYRE_API_KEY\`)
 to find the project by its \`github_repo\` and pick a category, then
 \`POST /api/v1/entries\` with ISO-8601 start/end WITH offset, a one-line
 outcome description, \`agent_label\` naming this agent, \`session_ref\`, and an

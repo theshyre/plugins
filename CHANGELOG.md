@@ -4,6 +4,29 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.11.0 — 2026-09-18
+
+- **A commit with unlogged time behind it prompts the agent to log it
+  (Claude Code).** Since 1.9.0 the hook posts nothing of its own while a
+  session runs, so the entry you expect to see is the agent's — and the agent
+  wrote it only if it noticed a unit of work had ended. A 105-minute planning
+  session ended in a commit and logged nothing until its owner asked where the
+  entry was. Now, after a `git commit`, `gh pr create` or `gh pr merge` with
+  fifteen or more active minutes of the session in no entry the agent has
+  logged, the hook hands the agent one line with the tool result: log it now
+  if this ends a unit, carry on if it does not. It repeats only after another
+  fifteen minutes of work, and an entry the agent writes (the MCP tool or a
+  `POST /api/v1/entries`) resets the count.
+- **No network, nothing stored.** The count comes from the hook's own beats;
+  the command line is read to recognize the commit and is never written down
+  or sent. `SHYRE_LOG_NUDGE_MINUTES` (or `"log_nudge_minutes"` in
+  `~/.shyre/config.json`) changes the threshold; `0` turns the note off.
+- **Codex and Cursor get no note** — only Claude Code is measured to pass a
+  hook's note to the model — so the convention's wording does the work
+  there, and it is wider everywhere: a commit the person asked for, a plan,
+  a document or a review delivered is a unit of work, and it is logged in the
+  turn it ends, before the wrap-up.
+
 ## 1.10.1 — 2026-09-17
 
 Hardening, from an audit of every place the runtime deletes something and a

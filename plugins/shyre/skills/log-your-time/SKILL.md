@@ -1,6 +1,6 @@
 ---
 name: log-your-time
-description: Log the time you just spent to Shyre when you finish a substantial unit of work (a shipped PR, a completed feature) in a repository Shyre tracks. Use the Shyre MCP tools or the REST API with the SHYRE_API_KEY bearer token. Covers picking the project and category, the time-window rules, idempotency, and what to do on a 409.
+description: Log the time you just spent to Shyre when you finish a substantial unit of work (a commit the person asked for, a shipped PR, a completed feature, a plan or document delivered) in a repository Shyre tracks. Use the Shyre MCP tools or the REST API with the SHYRE_API_KEY bearer token. Covers picking the project and category, the time-window rules, idempotency, and what to do on a 409.
 ---
 
 # Log your own time to Shyre
@@ -24,8 +24,22 @@ own time-logging convention, follow that instead.
 
 ## When
 
-At the end of a substantial unit of work: a PR opened or merged, a feature
-completed, a review delivered. Not after every small edit.
+At the end of a substantial unit of work: a commit the person asked for, a
+PR opened or merged, a feature completed, a plan, document or review
+delivered. Planning and writing are work: a session that produced a roadmap
+and no code is a unit like any other. Not after every small edit.
+
+Log it **in the same turn the unit ends, before you write the wrap-up**. The
+person expects to see the entry while the session is still open; the session
+hooks are the backstop, not the plan, and they post nothing of their own
+while an entry of yours could still arrive.
+
+In Claude Code the hook helps you notice (1.11.0): after a `git commit`,
+`gh pr create` or `gh pr merge` with fifteen or more minutes of this session
+in no entry you have logged, a one-line note from Shyre arrives with the tool
+result. It is a prompt, not an order — if the unit is still open, carry on,
+and it returns only after another fifteen minutes of work. Other agents get
+no note; the rule above is the whole control there.
 
 ## How
 

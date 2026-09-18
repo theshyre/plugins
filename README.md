@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.10.1 (2026-09-17) — see `CHANGELOG.md`.
+**Latest release:** 1.11.0 (2026-09-18) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -14,6 +14,10 @@ export SHYRE_API_KEY="shyre_pat_…"   # from Settings → Integrations in Shyre
 ```
 
 That is the whole setup for Claude Code.
+
+**Requires Node.js 18 or later** (`node --version`). The hooks that record
+time are a Node.js program; without Node.js the plugin installs and its tools
+work, but nothing is recorded.
 
 **It keeps itself current, and you should know how (1.10.0).** Claude Code
 auto-updates only Anthropic's own marketplaces by default, so a plugin from
@@ -75,7 +79,10 @@ first so one set of hooks runs.
   the release notes". The hooks have no browser, so they read
   `SHYRE_API_KEY` from the shell that launches `claude`.
 - **`log-your-time`**, the skill: how an agent logs a categorized,
-  invoice-ready entry at the end of a unit of work.
+  invoice-ready entry at the end of a unit of work — and, in Claude Code, a
+  one-line note from the hook when a commit lands with fifteen or more
+  unlogged minutes behind it, so the entry does not depend on the agent
+  noticing the moment.
 - **Backfill.** `backfill --since=YYYY-MM-DD --dry-run` reconstructs runs
   from this machine's Claude Code transcripts for sessions before the plugin
   was installed — timestamps only — and logs them marked *backfilled*.
