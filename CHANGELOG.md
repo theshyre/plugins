@@ -4,6 +4,22 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.11.1 — 2026-09-18
+
+- **A session running old code says so (Claude Code).** Claude Code's updater
+  lands a release in the background a few minutes *after* a session starts,
+  and a session keeps the version it loaded — so the session that downloads a
+  release never runs it, and nothing in it said so. 1.11.0 was on disk three
+  minutes into a session whose owner had restarted to get it. Now, when Claude
+  Code's own install record names a newer version of this plugin than the one
+  the session is running, your next prompt gets one line, in the terminal and
+  to the agent: *Shyre plugin X is installed, but this session is still
+  running Y. Type /reload-plugins (or restart Claude Code) to pick it up.*
+  Once per session per version. Time is recorded by the old version
+  meanwhile; nothing is lost.
+- Read from `installed_plugins.json`, never from folder names: old version
+  folders linger, and a folder is not an install. No network.
+
 ## 1.11.0 — 2026-09-18
 
 - **A commit with unlogged time behind it prompts the agent to log it

@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.11.0";
+var VERSION = "1.11.1";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -850,9 +850,22 @@ function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const now = Date.now();
   appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}
 `);
+  let said = false;
+  if (k === "prompt") {
+    try {
+      const reload = reloadNotice(agent, base, normalizePayload(payload).cwd);
+      if (reload !== null) {
+        said = true;
+        process.stdout.write(`${reload}
+`);
+      }
+    } catch (err) {
+      noteOncePerMinute("reload-notice", `${agent}	reload notice skipped: ${errorMessage(err)}`);
+    }
+  }
   try {
     const notice = logNudge(agent, session, base, payload, now, cfg);
-    if (notice !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}
+    if (notice !== null && !said) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}
 `);
   } catch (err) {
     noteOncePerMinute("nudge", `${agent}	log-your-time note skipped: ${errorMessage(err)}`);
@@ -1132,9 +1145,11 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
     unlinkSync(`${base}.meta.json`);
   } catch {
   }
-  try {
-    unlinkSync(`${base}.nudge.json`);
-  } catch {
+  for (const ext of [".nudge.json", ".reload-told"]) {
+    try {
+      unlinkSync(`${base}${ext}`);
+    } catch {
+    }
   }
   if (runs.length > 0) detachedFlush();
 }
@@ -2138,6 +2153,49 @@ function staleNotice(agent = "claude", env = process.env, apiUrl = DEFAULT_API_U
   })() : (agent === "codex" || agent === "cursor") && /turned off/.test(selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) ?? "") ? "Self-update is turned off here; run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature \u2014 never a bare download." : agent === "codex" || agent === "cursor" ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.` : `Replace the runtime: ${download}.`;
   return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
 }
+var PLUGIN_CACHE_PATH = /^(.*[\\/]plugins)[\\/]cache[\\/]theshyre[\\/]shyre[\\/][^\\/]+[\\/]hooks[\\/][^\\/]+$/;
+function isWithin(dir, root) {
+  const d = resolve(dir);
+  const r = resolve(root);
+  return d === r || d.startsWith(r.endsWith(sep) ? r : `${r}${sep}`);
+}
+function installedAhead(runningPath = selfPath(), running = VERSION, cwd = process.cwd()) {
+  const m = PLUGIN_CACHE_PATH.exec(runningPath);
+  if (!m || m[1] === void 0) return null;
+  const record = readJson(join(m[1], "installed_plugins.json"));
+  const plugins = record && isRecord(record.plugins) ? record.plugins : record;
+  const entries = plugins && Array.isArray(plugins[PLUGIN_ID]) ? plugins[PLUGIN_ID] : [];
+  const wide = [];
+  const pinned = [];
+  for (const entry of entries) {
+    if (!isRecord(entry) || typeof entry.version !== "string" || !/^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(entry.version)) continue;
+    const projectPath = typeof entry.projectPath === "string" && entry.projectPath ? entry.projectPath : null;
+    if (projectPath !== null) {
+      if (isWithin(cwd, projectPath)) pinned.push(entry.version);
+    } else if (entry.scope === void 0 || entry.scope === "user" || entry.scope === "managed") {
+      wide.push(entry.version);
+    }
+  }
+  let best = null;
+  for (const version of pinned.length > 0 ? pinned : wide) if (isNewerVersion(version, best ?? running)) best = version;
+  return best;
+}
+function reloadNotice(agent, base, cwd, runningPath = selfPath(), running = VERSION) {
+  if (agent !== "claude") return null;
+  const ahead = installedAhead(runningPath, running, cwd);
+  if (ahead === null) return null;
+  const stamp = `${base}.reload-told`;
+  try {
+    if (readFileSync(stamp, "utf8").trim() === ahead) return null;
+  } catch {
+  }
+  writeAtomic(stamp, ahead, 384);
+  const line = `Shyre plugin ${ahead} is installed, but this session is still running ${running}. Type /reload-plugins (or restart Claude Code) to pick it up.`;
+  return JSON.stringify({
+    systemMessage: line,
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: `${line} Nothing is lost meanwhile: time is still recorded by ${running}. Tell the person once; do not run anything yourself.` }
+  });
+}
 var TOKEN_REFUSAL_NOTICE_THRESHOLD = 3;
 function tokenRefusalNotice() {
   const state = readTokenRefusalState();
@@ -2176,7 +2234,7 @@ function salvageStaleSessions(cfg, now = Date.now()) {
     if (newest >= now - STALE_SESSION_DAYS * 864e5) continue;
     const base = join(dir, name);
     const remove = () => {
-      for (const ext of [".marks", ".meta.json", ".nudge.json"]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told"]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {
@@ -3103,6 +3161,7 @@ export {
   installCursor,
   installId,
   installOrigin,
+  installedAhead,
   installedRuntimePath,
   interpretPluginUpdate,
   isAgent,
@@ -3139,6 +3198,7 @@ export {
   readTranscriptSessions,
   readUpgradeRequiredState,
   refusalLogPath,
+  reloadNotice,
   repoKeyFromRemote,
   resolveFromMap,
   salvageStaleSessions,

@@ -125,7 +125,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.11.0";
+export const VERSION = "1.11.1";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -1464,9 +1464,22 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: P
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
   const now = Date.now();
   appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}\n`);
+  // One invocation prints at most ONE JSON document: two lines are not JSON.
+  let said = false;
+  if (k === "prompt") {
+    try {
+      const reload = reloadNotice(agent, base, normalizePayload(payload).cwd);
+      if (reload !== null) {
+        said = true;
+        process.stdout.write(`${reload}\n`);
+      }
+    } catch (err) {
+      noteOncePerMinute("reload-notice", `${agent}\treload notice skipped: ${errorMessage(err)}`);
+    }
+  }
   try {
     const notice = logNudge(agent, session, base, payload, now, cfg);
-    if (notice !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}\n`);
+    if (notice !== null && !said) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}\n`);
   } catch (err) {
     noteOncePerMinute("nudge", `${agent}\tlog-your-time note skipped: ${errorMessage(err)}`);
   }
@@ -1875,10 +1888,12 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
   } catch {
     /* already gone */
   }
-  try {
-    unlinkSync(`${base}.nudge.json`);
-  } catch {
-    /* never written, or already gone */
+  for (const ext of [".nudge.json", ".reload-told"]) {
+    try {
+      unlinkSync(`${base}${ext}`);
+    } catch {
+      /* never written, or already gone */
+    }
   }
   if (runs.length > 0) detachedFlush();
 }
@@ -3524,6 +3539,88 @@ export function staleNotice(agent: Agent = "claude", env: Env = process.env, api
   return `Shyre hook ${VERSION} is installed and ${newest.version} is available (per ${newest.source}). ${how} Tell the person.`;
 }
 
+// ---------------------------------------------------------------------------
+// "You are running old code" — said INSIDE the session (1.11.1)
+// ---------------------------------------------------------------------------
+//
+// Every notice above is a SessionStart line. But Claude Code's updater lands
+// a release in the background a few minutes AFTER a session starts, and a
+// session keeps the version folder it loaded: the session that downloads a
+// release never runs it, and nothing in it says so. 1.11.0 was on disk three
+// minutes into a session whose owner had restarted precisely to get it
+// (2026-09-18). The fact is on disk — Claude Code's own install record — so
+// the next prompt can say it, to the person and to the agent.
+
+const PLUGIN_CACHE_PATH = /^(.*[\\/]plugins)[\\/]cache[\\/]theshyre[\\/]shyre[\\/][^\\/]+[\\/]hooks[\\/][^\\/]+$/;
+
+/** Is `dir` the directory `root`, or inside it? Compared as resolved paths. */
+function isWithin(dir: string, root: string): boolean {
+  const d = resolve(dir);
+  const r = resolve(root);
+  return d === r || d.startsWith(r.endsWith(sep) ? r : `${r}${sep}`);
+}
+
+/**
+ * The newest version of this plugin Claude Code records as INSTALLED for
+ * THIS session, when it is newer than the copy running. Read from
+ * `installed_plugins.json` beside the cache this copy runs from — never a
+ * sibling folder's name: old folders linger, and a folder is not an install.
+ *
+ * An install record has a scope. One pinned to another project says nothing
+ * about this session, and one pinned to THIS project (its `projectPath` is
+ * the session's directory or above it) is what a reload would load, whatever
+ * the user-wide record says — so when such a pin exists only it is read. A
+ * notice that /reload-plugins cannot clear is worse than none (review,
+ * 2026-09-18).
+ */
+export function installedAhead(runningPath: string = selfPath(), running: string = VERSION, cwd: string = process.cwd()): string | null {
+  const m = PLUGIN_CACHE_PATH.exec(runningPath);
+  if (!m || m[1] === undefined) return null;
+  const record = readJson(join(m[1], "installed_plugins.json"));
+  const plugins = record && isRecord(record.plugins) ? record.plugins : record;
+  const entries = plugins && Array.isArray(plugins[PLUGIN_ID]) ? (plugins[PLUGIN_ID] as unknown[]) : [];
+  const wide: string[] = [];
+  const pinned: string[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry) || typeof entry.version !== "string" || !/^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(entry.version)) continue;
+    const projectPath = typeof entry.projectPath === "string" && entry.projectPath ? entry.projectPath : null;
+    if (projectPath !== null) {
+      if (isWithin(cwd, projectPath)) pinned.push(entry.version);
+    } else if (entry.scope === undefined || entry.scope === "user" || entry.scope === "managed") {
+      wide.push(entry.version);
+    }
+  }
+  let best: string | null = null;
+  for (const version of pinned.length > 0 ? pinned : wide) if (isNewerVersion(version, best ?? running)) best = version;
+  return best;
+}
+
+/**
+ * What a prompt beat prints when a newer install is waiting: one JSON object
+ * carrying a line for the person (`systemMessage`, shown in the terminal) and
+ * the same fact for the agent. Once per session per version — stamped beside
+ * the session's marks — because every prompt after the first is a nag.
+ * Claude Code only, and only a marketplace install: nothing else has a
+ * version folder to be behind.
+ */
+export function reloadNotice(agent: Agent, base: string, cwd: string, runningPath: string = selfPath(), running: string = VERSION): string | null {
+  if (agent !== "claude") return null;
+  const ahead = installedAhead(runningPath, running, cwd);
+  if (ahead === null) return null;
+  const stamp = `${base}.reload-told`;
+  try {
+    if (readFileSync(stamp, "utf8").trim() === ahead) return null;
+  } catch {
+    /* not said yet */
+  }
+  writeAtomic(stamp, ahead, 0o600);
+  const line = `Shyre plugin ${ahead} is installed, but this session is still running ${running}. Type /reload-plugins (or restart Claude Code) to pick it up.`;
+  return JSON.stringify({
+    systemMessage: line,
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: `${line} Nothing is lost meanwhile: time is still recorded by ${running}. Tell the person once; do not run anything yourself.` },
+  });
+}
+
 /** Delivery attempts in a row the token must be refused before a session
  *  start says so. Below this, a rotated key is still "the next sweep will
  *  probably work" — saying so on the very first 401 would cry wolf over one
@@ -3604,7 +3701,7 @@ export function salvageStaleSessions(cfg: Pick<Config, "idleCapSeconds">, now: n
     if (newest >= now - STALE_SESSION_DAYS * 86_400_000) continue;
     const base = join(dir, name);
     const remove = (): void => {
-      for (const ext of [".marks", ".meta.json", ".nudge.json"]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told"]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {
