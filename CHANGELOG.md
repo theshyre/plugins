@@ -4,6 +4,36 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.12.0 — 2026-09-18
+
+- **An open session runs a new release without being reloaded (Claude
+  Code).** A session keeps the version folder it loaded, and Claude Code's
+  updater installs a release a few minutes after a session starts — so every
+  release used to reach a session one restart late, and 1.11.1 could only
+  tell you to type `/reload-plugins`. A hook is a fresh process each time, so
+  now each call checks Claude Code's own install record and, when a newer
+  version of this plugin is installed for this session, runs that version's
+  runtime instead. Nothing to type. From this version on; a session still on
+  1.11.1 or older needs its one last reload.
+- **It never makes a session worse than having no hand-off.** The target must
+  be the version the install record names, a regular file (not a link) inside
+  the same plugin cache this copy runs from, and a runtime that says it
+  accepts a hand-off. Anything else, or any throw inside it, and the copy
+  the session loaded does the work itself and writes why to
+  `~/.shyre/refusals.log`. A newer runtime that *exits the process* or never
+  returns is not a throw: a version that exits is refused for good, one whose
+  hand-off never finished is refused for six hours (the host kills a hook for
+  a slow disk as readily as for a hung release), the hook still exits 0, and
+  the loaded copy carries on. `doctor` has a `hand-off:` line that names a
+  refusal and the file to delete to try again. Measured cost: none (30 ms a hook call either way).
+- **No new trust.** It is the same file, from the same marketplace, placed by
+  Claude Code's own installer, that your next session would have run anyway.
+  Nothing is downloaded. `SHYRE_HOOK_AUTO_UPDATE=0` (or `"auto_update":
+  false`) turns it off, and the session then keeps the version it loaded and
+  says so once.
+- Only the hook runtime moves this way. A changed skill or hook wiring still
+  arrives with `/reload-plugins` or the next session.
+
 ## 1.11.1 — 2026-09-18
 
 - **A session running old code says so (Claude Code).** Claude Code's updater

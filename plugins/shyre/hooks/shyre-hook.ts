@@ -122,10 +122,10 @@ import {
   writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.11.1";
+export const VERSION = "1.12.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -1251,10 +1251,12 @@ function readStdinText(): string {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function readStdin(): unknown {
+/** `given` is a payload another copy of this runtime already read from the
+ *  pipe (the hand-off, 1.12.0): stdin can be read once. */
+function readStdin(given?: string): unknown {
   try {
     // A byte-order mark is not JSON, and some hosts on Windows send one.
-    const text = readStdinText().replace(/^\uFEFF/, "");
+    const text = (given ?? readStdinText()).replace(/^\uFEFF/, "");
     if (text.length > STDIN_MAX_BYTES) {
       noteOncePerMinute("stdin-size", `payload of ${text.length} bytes ignored: larger than ${STDIN_MAX_BYTES}`);
       return {};
@@ -3595,6 +3597,217 @@ export function installedAhead(runningPath: string = selfPath(), running: string
   return best;
 }
 
+// ---------------------------------------------------------------------------
+// The hand-off: an open session runs the newest INSTALLED runtime (1.12.0)
+// ---------------------------------------------------------------------------
+//
+// Saying "reload" still leaves the person a chore in every open session after
+// every release. A hook is a fresh `node` process each time, so this copy can
+// simply run the newer one: same marketplace, same cache, put there by Claude
+// Code's own installer, and exactly the file the NEXT session would run.
+// What it must never do is make a session worse than having no hand-off: any
+// doubt about the target, and any throw inside it, ends with this copy
+// doing the work itself (an exit or a hang: see the announcement below). Marks, spool items and session end are all safe to
+// repeat (a duplicate mark is a zero gap; the spool is keyed on the run's
+// start; a second `end` finds no header), so the fallback cannot double-count.
+
+/** The marker a runtime exports to say its `main` accepts a pre-read payload.
+ *  1.11.1 and older export `main(argv)` only: handed a consumed stdin they
+ *  would record nothing, so they are never a target — and never can be, since
+ *  a target is always NEWER than the copy that carries this code. */
+export const HANDOFF = 1;
+
+/**
+ * `import(url)`, spelled so that no bundler sees an import expression. The
+ * tests load this file's BUILD through Vite, which answers a dynamic import
+ * by prepending a client import to the file — ahead of the `#!` line, which
+ * then no longer parses. The body is a constant; only the URL varies, and it
+ * is an argument, never part of the source text.
+ *
+ * Built when CALLED, inside the hand-off's try — never at module scope. Under
+ * `--disallow-code-generation-from-strings` the constructor throws, and at
+ * module scope that was every hook event and `doctor` too, dead on import
+ * (SAL-263, caught in review before release). Here it is one declined
+ * hand-off.
+ */
+function importByUrl(url: string): Promise<unknown> {
+  const load = new Function("url", "return import(url)") as (u: string) => Promise<unknown>;
+  return load(url);
+}
+
+// A release that THROWS is caught below. One that calls process.exit(), or
+// never returns, is not a throw — and unlike a bad release met at session
+// start, it would break sessions that were running a good copy a moment ago.
+// So a hand-off is announced on disk before it starts and cleared when it
+// ends; a version that exited mid-way, or whose announcement was never
+// cleared, is refused from then on and the loaded copy carries on. A fixed
+// release has a new number, so nothing needs clearing by hand.
+
+/** Longer than the longest hook budget (10 s): an announcement older than
+ *  this belongs to a hand-off that was killed or never returned. */
+export const HANDOFF_STUCK_MS = 15_000;
+
+/** How long a version stays refused after a hand-off that never FINISHED.
+ *  That evidence is circumstantial — the host kills a hook at its budget for
+ *  a slow disk as readily as for a hung release — so it buys a pause, not a
+ *  verdict: a healthy version refused for good is a fix that never reaches
+ *  an open session (SAL-264). A version that EXITED the process is refused
+ *  for good: that is the release's own act. */
+export const HANDOFF_RETRY_MS = 6 * 3_600_000;
+
+/** One announcement per PROCESS: hook calls overlap (tools run in parallel),
+ *  and with one shared file a fast call's cleanup erased a slow call's
+ *  announcement, so a genuinely hung release went unseen. */
+function handOffPendingPath(pid: number = process.pid): string {
+  return join(shyreHome(), `handoff-pending.${pid}.json`);
+}
+
+function handOffRefusedPath(): string {
+  return join(shyreHome(), "handoff-refused.json");
+}
+
+function refuseHandOff(version: string, why: string, until: number | null): void {
+  try {
+    writeAtomic(handOffRefusedPath(), JSON.stringify({ version, why, at: nowIso(), until }), 0o600);
+    logRefusal(`hand-off\t${version} is refused ${until === null ? "from now on" : `until ${isoSeconds(until)}`} (${why}); ${VERSION} carries on, and /reload-plugins or a new session still loads it`);
+  } catch {
+    /* an unwritable home: the next call finds out again */
+  }
+}
+
+export interface HandOffRefusal {
+  version: string;
+  why: string;
+  /** Epoch ms after which it is tried again; null is for good. */
+  until: number | null;
+}
+
+/** The refusal on file, when it is well-formed and still in force. */
+export function readHandOffRefusal(now: number = Date.now()): HandOffRefusal | null {
+  const r = readJson(handOffRefusedPath());
+  if (!r || typeof r.version !== "string" || !/^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(r.version)) return null;
+  const until = typeof r.until === "number" && Number.isFinite(r.until) ? r.until : null;
+  if (until !== null && now >= until) return null;
+  // Printed by doctor: a short sentence in a plain alphabet, or nothing.
+  const why = typeof r.why === "string" && /^[A-Za-z ,.'-]{1,80}$/.test(r.why) ? r.why : "no reason recorded";
+  return { version: r.version, why, until };
+}
+
+/** Is this version refused — already, or as of this look at a stale announcement? */
+export function handOffRefused(version: string, now: number = Date.now()): boolean {
+  if (readHandOffRefusal(now)?.version === version) return true;
+  let stuck = false;
+  try {
+    for (const name of readdirSync(shyreHome())) {
+      if (!/^handoff-pending\.\d+\.json$/.test(name)) continue;
+      const path = join(shyreHome(), name);
+      const pending = readJson(path);
+      const at = pending && typeof pending.at === "number" ? pending.at : null;
+      if (at !== null && now - at <= HANDOFF_STUCK_MS) continue; // a parallel call, mid-flight
+      if (pending && pending.version === version) stuck = true;
+      try {
+        unlinkSync(path); // stale, or unreadable: either way it is nobody's any more
+      } catch {
+        /* already gone */
+      }
+    }
+  } catch {
+    return false; // no home yet: nothing was ever announced
+  }
+  if (stuck) refuseHandOff(version, "an earlier hand-off to it never finished", now + HANDOFF_RETRY_MS);
+  return stuck;
+}
+
+/** Doctor's line: whether a session here runs newer installs, and what stands in the way. */
+export function handOffDoctorLine(cfg: Pick<Config, "autoUpdate">, env: Env = process.env, now: number = Date.now()): string {
+  if (env.SHYRE_HOOK_AUTO_UPDATE === "0" || cfg.autoUpdate === false) return "hand-off: off — updates are turned off, so an open session keeps the runtime it loaded";
+  const refusal = readHandOffRefusal(now);
+  if (refusal) return `hand-off: ${refusal.version} is refused ${refusal.until === null ? "for good" : `until ${isoSeconds(refusal.until)}`} (${refusal.why}); delete ${handOffRefusedPath()} to try it again`;
+  return "hand-off: on — an open Claude Code session runs the newest installed runtime";
+}
+
+export interface HandOffDeps {
+  runningPath?: string;
+  running?: string;
+  env?: Env;
+  /** Load a module by file path; injected so the decision is testable without a second build. */
+  load?: (path: string) => Promise<unknown>;
+}
+
+/**
+ * The newer runtime's file, when there is one this session should be running
+ * and it is what it must be: a regular file (not a link) inside the same
+ * version cache this copy runs from. Null otherwise, with nothing logged —
+ * "no newer install" is the ordinary answer on every tool call.
+ */
+export function handOffTarget(payloadCwd: string, cfg: Pick<Config, "autoUpdate">, deps: HandOffDeps = {}): { path: string; version: string } | null {
+  const env = deps.env ?? process.env;
+  // Whoever turned updates off asked to run what they have.
+  if (env.SHYRE_HOOK_AUTO_UPDATE === "0" || cfg.autoUpdate === false) return null;
+  const runningPath = deps.runningPath ?? selfPath();
+  const version = installedAhead(runningPath, deps.running ?? VERSION, payloadCwd);
+  if (version === null) return null;
+  const cacheRoot = dirname(dirname(dirname(runningPath)));
+  const path = join(cacheRoot, version, "hooks", basename(runningPath));
+  try {
+    const stat = lstatSync(path);
+    // One name, one file: a hard link's bytes can live anywhere, and realpath
+    // does not see it. Said, because a filesystem that reports some other
+    // count for every file would otherwise switch this off in silence.
+    if (!stat.isFile() || stat.nlink !== 1) {
+      noteOncePerMinute("handoff-declined", `hand-off to ${version} declined: ${stat.isFile() ? `its file reports ${stat.nlink} links, not 1` : "it is not a regular file"}; ${VERSION} carries on`);
+      return null;
+    }
+    if (!isWithin(realpathSync(path), realpathSync(cacheRoot))) return null;
+  } catch {
+    return null; // recorded as installed, not on disk (yet): this copy carries on
+  }
+  if (handOffRefused(version)) return null;
+  return { path, version };
+}
+
+/**
+ * Run the newer installed runtime in this process, with the payload this
+ * copy already read. True only when it ran to completion; false means the
+ * caller does the work itself.
+ */
+export async function handOff(argv: readonly string[], stdinText: string, cfg: Pick<Config, "autoUpdate">, deps: HandOffDeps = {}): Promise<boolean> {
+  let target: { path: string; version: string } | null = null;
+  try {
+    target = handOffTarget(normalizePayload(readStdin(stdinText), deps.env ?? process.env).cwd, cfg, deps);
+    if (target === null) return false;
+    const load = deps.load ?? ((path: string): Promise<unknown> => importByUrl(pathToFileURL(path).href));
+    const mod = await load(target.path);
+    if (!isRecord(mod) || mod.HANDOFF !== HANDOFF || mod.VERSION !== target.version || typeof mod.main !== "function") {
+      noteOncePerMinute("handoff-declined", `hand-off to ${target.version} declined: that file is not a runtime that accepts one; ${VERSION} carries on`);
+      return false;
+    }
+    const version = target.version;
+    // process.exit() inside the target runs no catch. This does run: the
+    // version is refused, and a hook still never fails a session.
+    const onExit = (): void => {
+      refuseHandOff(version, "it ended the process instead of returning", null);
+      process.exitCode = 0;
+    };
+    writeAtomic(handOffPendingPath(), JSON.stringify({ version, at: Date.now() }), 0o600);
+    process.once("exit", onExit);
+    try {
+      await (mod.main as (argv: readonly string[], stdinText: string) => Promise<void>)(argv, stdinText);
+    } finally {
+      process.removeListener("exit", onExit);
+      try {
+        unlinkSync(handOffPendingPath());
+      } catch {
+        /* a parallel hook call cleared it */
+      }
+    }
+    return true;
+  } catch (err) {
+    noteOncePerMinute("handoff", `hand-off to ${target?.version ?? "a newer install"} failed, ${VERSION} did the work instead: ${errorMessage(err).slice(0, 200)}`);
+    return false;
+  }
+}
+
 /**
  * What a prompt beat prints when a newer install is waiting: one JSON object
  * carrying a line for the person (`systemMessage`, shown in the terminal) and
@@ -4368,6 +4581,7 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
     return `config file: ${mode & 0o077 ? `present — WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600"}`;
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
+  attempt("hand-off", () => handOffDoctorLine(cfg));
   attempt("checkpoints", () => `checkpoints: ${cfg.checkpointSeconds > 0 ? `a stop after ${cfg.checkpointSeconds}s of unposted work posts it` : "off — every run waits for session end"}`);
   attempt("self-update", () => {
     const skip = selfUpdateSkipReason(cfg, { publicKeyPems: HOOK_SIGNING_PUBLIC_KEYS, runningPath: selfPath(), installedPath: installedRuntimePath(), env: process.env });
@@ -4790,7 +5004,7 @@ export async function cmdUpdate(cfg: Config): Promise<void> {
 /** The interactive commands: errors reach the terminal and the exit code. */
 const INTERACTIVE = new Set(["install", "doctor", "backfill", "update"]);
 
-export async function main(argv: readonly string[]): Promise<void> {
+export async function main(argv: readonly string[], stdinText?: string): Promise<void> {
   const positional = argv.filter((a) => !a.startsWith("--"));
   const [first, second, third] = positional;
   const cfg = readConfig();
@@ -4816,7 +5030,20 @@ export async function main(argv: readonly string[]): Promise<void> {
     return;
   }
   if (first === undefined || !isAgent(first)) return;
-  const payload = readStdin();
+  // A payload handed in means a copy of this runtime already decided to hand
+  // off to this one: it is never handed on again.
+  let text = stdinText;
+  if (text === undefined) {
+    try {
+      text = readStdinText();
+    } catch (err) {
+      // Said here, because `readStdin("")` below sees an empty payload, not a failure.
+      noteOncePerMinute("stdin-json", `payload could not be read, nothing recorded: ${errorMessage(err).slice(0, 120)}`);
+      text = "";
+    }
+    if (await handOff(argv, text, cfg)) return;
+  }
+  const payload = readStdin(text);
   if (second === "start") return cmdStart(first, payload, true);
   if (second === "beat") return cmdBeat(first, payload, third || "tool", cfg);
   if (second === "end") return cmdEnd(first, payload, cfg);

@@ -31,7 +31,7 @@ import {
   writeSync
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 /*!
  * Shyre agent-session logger — ONE runtime for every coding agent.
@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.11.1";
+var VERSION = "1.12.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -727,9 +727,9 @@ function readStdinText() {
   }
   return Buffer.concat(chunks).toString("utf8");
 }
-function readStdin() {
+function readStdin(given) {
   try {
-    const text = readStdinText().replace(/^\uFEFF/, "");
+    const text = (given ?? readStdinText()).replace(/^\uFEFF/, "");
     if (text.length > STDIN_MAX_BYTES) {
       noteOncePerMinute("stdin-size", `payload of ${text.length} bytes ignored: larger than ${STDIN_MAX_BYTES}`);
       return {};
@@ -2180,6 +2180,116 @@ function installedAhead(runningPath = selfPath(), running = VERSION, cwd = proce
   for (const version of pinned.length > 0 ? pinned : wide) if (isNewerVersion(version, best ?? running)) best = version;
   return best;
 }
+var HANDOFF = 1;
+function importByUrl(url) {
+  const load = new Function("url", "return import(url)");
+  return load(url);
+}
+var HANDOFF_STUCK_MS = 15e3;
+var HANDOFF_RETRY_MS = 6 * 36e5;
+function handOffPendingPath(pid = process.pid) {
+  return join(shyreHome(), `handoff-pending.${pid}.json`);
+}
+function handOffRefusedPath() {
+  return join(shyreHome(), "handoff-refused.json");
+}
+function refuseHandOff(version, why, until) {
+  try {
+    writeAtomic(handOffRefusedPath(), JSON.stringify({ version, why, at: nowIso(), until }), 384);
+    logRefusal(`hand-off	${version} is refused ${until === null ? "from now on" : `until ${isoSeconds(until)}`} (${why}); ${VERSION} carries on, and /reload-plugins or a new session still loads it`);
+  } catch {
+  }
+}
+function readHandOffRefusal(now = Date.now()) {
+  const r = readJson(handOffRefusedPath());
+  if (!r || typeof r.version !== "string" || !/^\d{1,5}\.\d{1,5}\.\d{1,5}$/.test(r.version)) return null;
+  const until = typeof r.until === "number" && Number.isFinite(r.until) ? r.until : null;
+  if (until !== null && now >= until) return null;
+  const why = typeof r.why === "string" && /^[A-Za-z ,.'-]{1,80}$/.test(r.why) ? r.why : "no reason recorded";
+  return { version: r.version, why, until };
+}
+function handOffRefused(version, now = Date.now()) {
+  if (readHandOffRefusal(now)?.version === version) return true;
+  let stuck = false;
+  try {
+    for (const name of readdirSync(shyreHome())) {
+      if (!/^handoff-pending\.\d+\.json$/.test(name)) continue;
+      const path = join(shyreHome(), name);
+      const pending = readJson(path);
+      const at = pending && typeof pending.at === "number" ? pending.at : null;
+      if (at !== null && now - at <= HANDOFF_STUCK_MS) continue;
+      if (pending && pending.version === version) stuck = true;
+      try {
+        unlinkSync(path);
+      } catch {
+      }
+    }
+  } catch {
+    return false;
+  }
+  if (stuck) refuseHandOff(version, "an earlier hand-off to it never finished", now + HANDOFF_RETRY_MS);
+  return stuck;
+}
+function handOffDoctorLine(cfg, env = process.env, now = Date.now()) {
+  if (env.SHYRE_HOOK_AUTO_UPDATE === "0" || cfg.autoUpdate === false) return "hand-off: off \u2014 updates are turned off, so an open session keeps the runtime it loaded";
+  const refusal = readHandOffRefusal(now);
+  if (refusal) return `hand-off: ${refusal.version} is refused ${refusal.until === null ? "for good" : `until ${isoSeconds(refusal.until)}`} (${refusal.why}); delete ${handOffRefusedPath()} to try it again`;
+  return "hand-off: on \u2014 an open Claude Code session runs the newest installed runtime";
+}
+function handOffTarget(payloadCwd, cfg, deps = {}) {
+  const env = deps.env ?? process.env;
+  if (env.SHYRE_HOOK_AUTO_UPDATE === "0" || cfg.autoUpdate === false) return null;
+  const runningPath = deps.runningPath ?? selfPath();
+  const version = installedAhead(runningPath, deps.running ?? VERSION, payloadCwd);
+  if (version === null) return null;
+  const cacheRoot = dirname(dirname(dirname(runningPath)));
+  const path = join(cacheRoot, version, "hooks", basename(runningPath));
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.nlink !== 1) {
+      noteOncePerMinute("handoff-declined", `hand-off to ${version} declined: ${stat.isFile() ? `its file reports ${stat.nlink} links, not 1` : "it is not a regular file"}; ${VERSION} carries on`);
+      return null;
+    }
+    if (!isWithin(realpathSync(path), realpathSync(cacheRoot))) return null;
+  } catch {
+    return null;
+  }
+  if (handOffRefused(version)) return null;
+  return { path, version };
+}
+async function handOff(argv, stdinText, cfg, deps = {}) {
+  let target = null;
+  try {
+    target = handOffTarget(normalizePayload(readStdin(stdinText), deps.env ?? process.env).cwd, cfg, deps);
+    if (target === null) return false;
+    const load = deps.load ?? ((path) => importByUrl(pathToFileURL(path).href));
+    const mod = await load(target.path);
+    if (!isRecord(mod) || mod.HANDOFF !== HANDOFF || mod.VERSION !== target.version || typeof mod.main !== "function") {
+      noteOncePerMinute("handoff-declined", `hand-off to ${target.version} declined: that file is not a runtime that accepts one; ${VERSION} carries on`);
+      return false;
+    }
+    const version = target.version;
+    const onExit = () => {
+      refuseHandOff(version, "it ended the process instead of returning", null);
+      process.exitCode = 0;
+    };
+    writeAtomic(handOffPendingPath(), JSON.stringify({ version, at: Date.now() }), 384);
+    process.once("exit", onExit);
+    try {
+      await mod.main(argv, stdinText);
+    } finally {
+      process.removeListener("exit", onExit);
+      try {
+        unlinkSync(handOffPendingPath());
+      } catch {
+      }
+    }
+    return true;
+  } catch (err) {
+    noteOncePerMinute("handoff", `hand-off to ${target?.version ?? "a newer install"} failed, ${VERSION} did the work instead: ${errorMessage(err).slice(0, 200)}`);
+    return false;
+  }
+}
 function reloadNotice(agent, base, cwd, runningPath = selfPath(), running = VERSION) {
   if (agent !== "claude") return null;
   const ahead = installedAhead(runningPath, running, cwd);
@@ -2740,6 +2850,7 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
     return `config file: ${mode & 63 ? `present \u2014 WARNING: mode ${mode.toString(8)} is readable by others; chmod 600 it` : "present, mode 600"}`;
   });
   attempt("idle cap", () => `idle cap: ${cfg.idleCapSeconds}s`);
+  attempt("hand-off", () => handOffDoctorLine(cfg));
   attempt("checkpoints", () => `checkpoints: ${cfg.checkpointSeconds > 0 ? `a stop after ${cfg.checkpointSeconds}s of unposted work posts it` : "off \u2014 every run waits for session end"}`);
   attempt("self-update", () => {
     const skip = selfUpdateSkipReason(cfg, { publicKeyPems: HOOK_SIGNING_PUBLIC_KEYS, runningPath: selfPath(), installedPath: installedRuntimePath(), env: process.env });
@@ -3038,7 +3149,7 @@ async function cmdUpdate(cfg) {
   if (state.outcome === "refused") process.exitCode = 1;
 }
 var INTERACTIVE = /* @__PURE__ */ new Set(["install", "doctor", "backfill", "update"]);
-async function main(argv) {
+async function main(argv, stdinText) {
   const positional = argv.filter((a) => !a.startsWith("--"));
   const [first, second, third] = positional;
   const cfg = readConfig();
@@ -3067,7 +3178,17 @@ ${notes.map((n) => `  - ${n}`).join("\n")}
     return;
   }
   if (first === void 0 || !isAgent(first)) return;
-  const payload = readStdin();
+  let text = stdinText;
+  if (text === void 0) {
+    try {
+      text = readStdinText();
+    } catch (err) {
+      noteOncePerMinute("stdin-json", `payload could not be read, nothing recorded: ${errorMessage(err).slice(0, 120)}`);
+      text = "";
+    }
+    if (await handOff(argv, text, cfg)) return;
+  }
+  const payload = readStdin(text);
   if (second === "start") return cmdStart(first, payload, true);
   if (second === "beat") return cmdBeat(first, payload, third || "tool", cfg);
   if (second === "end") return cmdEnd(first, payload, cfg);
@@ -3108,6 +3229,9 @@ export {
   DROP_REPORT_PATH,
   FOLD_HOLD_HOURS,
   FOLD_SLACK_MS,
+  HANDOFF,
+  HANDOFF_RETRY_MS,
+  HANDOFF_STUCK_MS,
   HELD_POST_MIN_SECONDS,
   HOOK_SIGNING_PUBLIC_KEYS,
   HOOK_WIRING,
@@ -3156,6 +3280,10 @@ export {
   foldTargets,
   formatBackfillPlan,
   gitRemote,
+  handOff,
+  handOffDoctorLine,
+  handOffRefused,
+  handOffTarget,
   hooksSessionMoving,
   installCodex,
   installCursor,
@@ -3192,6 +3320,7 @@ export {
   prometheusPort,
   promptMarksFor,
   readConfig,
+  readHandOffRefusal,
   readPluginUpdateState,
   readSelfUpdateState,
   readTokenRefusalState,

@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.11.1 (2026-09-18) — see `CHANGELOG.md`.
+**Latest release:** 1.12.0 (2026-09-18) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -28,7 +28,7 @@ and `claude plugin update shyre@theshyre` for you, in the background, at most
 every six hours. Nothing is downloaded by the plugin itself and no new source
 is trusted: it is the same updater pulling the same repository you installed
 from. The new version applies at your next session, which says once that it
-updated. A session that was already open when the update landed keeps running the old version; from 1.11.1 it says so at your next prompt, once, in the terminal and to the agent: type `/reload-plugins`, or restart. To turn it off: `SHYRE_HOOK_AUTO_UPDATE=0`, or `"auto_update":
+updated. A session that was already open when the update landed picks it up by itself (1.12.0): each hook call checks Claude Code's install record and runs the newest installed runtime, so there is nothing to type. Only the hook runtime moves that way — a changed skill or hook wiring still arrives with `/reload-plugins` or the next session — and with updates turned off the session keeps the version it loaded and says so once, at your next prompt. To turn it off: `SHYRE_HOOK_AUTO_UPDATE=0`, or `"auto_update":
 false` in `~/.shyre/config.json` — and it stays off wherever anyone has
 written `autoUpdate: false` for the marketplace, an administrator's managed
 settings included. `node …/shyre-hook.mjs doctor` shows whether it is on and
