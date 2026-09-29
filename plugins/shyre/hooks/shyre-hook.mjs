@@ -128,7 +128,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.14.0";
+var VERSION = "1.14.1";
+var CLAUDE_UPDATE_HOW = "run `claude plugin update shyre@theshyre` in a terminal (or `! claude plugin update shyre@theshyre` in the session), then /reload-plugins";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -2207,10 +2208,10 @@ function staleNotice(agent = "claude", env = process.env, apiUrl = DEFAULT_API_U
       return `It already updated itself to ${last.to}; that applies at the next session \u2014 nothing to run.`;
     }
     if (last.outcome === "current") {
-      return "It asked Claude Code's updater, which does not see that release yet; it asks again within six hours. If this keeps being said, run /plugin update shyre@theshyre.";
+      return `It asked Claude Code's updater, which does not see that release yet; it asks again within six hours. If this keeps being said, ${CLAUDE_UPDATE_HOW}.`;
     }
-    return last.outcome === "failed" ? `It tried to update itself and could not (${safeWhy(last.why)}); run /plugin update shyre@theshyre, then /reload-plugins.` : "It updates itself through Claude Code's own updater, and the new version applies at the next session \u2014 nothing to run.";
-  })() : "Run /plugin update shyre@theshyre, then /reload-plugins \u2014 or turn on auto-update once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update." : (agent === "codex" || agent === "cursor") && selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) === null ? (() => {
+    return last.outcome === "failed" ? `It tried to update itself and could not (${safeWhy(last.why)}); ${CLAUDE_UPDATE_HOW}.` : "It updates itself through Claude Code's own updater, and the new version applies at the next session \u2014 nothing to run.";
+  })() : `To update, ${CLAUDE_UPDATE_HOW} \u2014 or turn on auto-update once: /plugin \u2192 Marketplaces \u2192 theshyre \u2192 Enable auto-update.` : (agent === "codex" || agent === "cursor") && selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) === null ? (() => {
     const last = readSelfUpdateState();
     return last.outcome === "refused" ? `The last self-update was refused (${last.why ?? "see ~/.shyre/refusals.log"}); run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature \u2014 never a bare download.` : "It replaces itself with the signed release on the next sweep; nothing to run.";
   })() : (agent === "codex" || agent === "cursor") && /turned off/.test(selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) ?? "") ? "Self-update is turned off here; run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature \u2014 never a bare download." : agent === "codex" || agent === "cursor" ? `Re-run the install: ${download}, then node ~/.shyre/bin/shyre-hook.mjs install ${agent}.` : `Replace the runtime: ${download}.`;
@@ -2378,7 +2379,7 @@ function tokenRefusalNotice() {
 function upgradeRequiredNotice(agent = "claude") {
   const state = readUpgradeRequiredState();
   if (!state) return null;
-  const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins." : "Run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature.";
+  const how = agent === "claude" ? `To update, ${CLAUDE_UPDATE_HOW}.` : "Run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature.";
   return `Shyre is refusing hook ${VERSION} as too old${state.minVersion ? ` (it needs ${state.minVersion} or newer)` : ""}, since ${state.since}. Nothing is lost if you update within ${DROP_GIVE_UP_DAYS} days: every run is kept on this machine and is delivered after the update. ${how} Tell the person.`;
 }
 function salvageStaleSessions(cfg, now = Date.now()) {
@@ -2936,7 +2937,7 @@ async function doctorLines(cfg, cwd = process.cwd(), probe = cfg.apiUrl === DEFA
   attempt("latest", () => {
     const newest = newestKnownVersion();
     if (!newest) return "latest: unknown \u2014 no sweep has asked the server yet, and no marketplace clone was found";
-    return isNewerVersion(newest.version, VERSION) ? `latest: ${newest.version} (per ${newest.source}) \u2014 this copy is ${VERSION}; see plugin-update and self-update above, or run /plugin update shyre@theshyre` : `latest: this copy (${VERSION}) is the newest anything here knows of`;
+    return isNewerVersion(newest.version, VERSION) ? `latest: ${newest.version} (per ${newest.source}) \u2014 this copy is ${VERSION}; see plugin-update and self-update above, or ${CLAUDE_UPDATE_HOW}` : `latest: this copy (${VERSION}) is the newest anything here knows of`;
   });
   attempt("log", () => {
     const target = refusalLogPath();
@@ -3282,6 +3283,7 @@ if (invokedDirectly()) {
 }
 export {
   AGENT_LABELS,
+  CLAUDE_UPDATE_HOW,
   COVERAGE_MAX_PAGES,
   COVERAGE_PAGE_SIZE,
   DEFAULT_API_URL,

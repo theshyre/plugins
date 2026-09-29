@@ -4,6 +4,15 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.14.1 — 2026-09-29
+
+- **The "update available" notices give a command that works.** They said
+  to run `/plugin update shyre@theshyre`, but inside a session `/plugin`
+  only opens the plugin browser and ignores the rest, so nothing updated.
+  They now say to run `claude plugin update shyre@theshyre` in a terminal
+  (or `! claude plugin update shyre@theshyre` in the session), then
+  `/reload-plugins`.
+
 ## 1.14.0 — 2026-09-29
 
 - **Leftover session time joins the entry beside it on a sub-project.** A

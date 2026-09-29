@@ -125,7 +125,18 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.14.0";
+export const VERSION = "1.14.1";
+
+/**
+ * How a person updates the Claude Code plugin by hand.
+ *
+ * ⚠️ NOT THE SLASH COMMAND. Inside a session `/plugin` opens the plugin
+ * browser and ignores its arguments (Claude Code 2.1.284, 2026-09-29), so every
+ * notice that told people to update with it sent them to a command that
+ * silently did nothing. The shell CLI is the one that updates; `!` runs it
+ * from inside the session.
+ */
+export const CLAUDE_UPDATE_HOW = "run `claude plugin update shyre@theshyre` in a terminal (or `! claude plugin update shyre@theshyre` in the session), then /reload-plugins";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -3646,13 +3657,13 @@ export function staleNotice(agent: Agent = "claude", env: Env = process.env, api
             // is named: not published yet, or a pinned marketplace. Said, so it
             // is never a silent dead end.
             if (last.outcome === "current") {
-              return "It asked Claude Code's updater, which does not see that release yet; it asks again within six hours. If this keeps being said, run /plugin update shyre@theshyre.";
+              return `It asked Claude Code's updater, which does not see that release yet; it asks again within six hours. If this keeps being said, ${CLAUDE_UPDATE_HOW}.`;
             }
             return last.outcome === "failed"
-              ? `It tried to update itself and could not (${safeWhy(last.why)}); run /plugin update shyre@theshyre, then /reload-plugins.`
+              ? `It tried to update itself and could not (${safeWhy(last.why)}); ${CLAUDE_UPDATE_HOW}.`
               : "It updates itself through Claude Code's own updater, and the new version applies at the next session — nothing to run.";
           })()
-        : "Run /plugin update shyre@theshyre, then /reload-plugins — or turn on auto-update once: /plugin → Marketplaces → theshyre → Enable auto-update."
+        : `To update, ${CLAUDE_UPDATE_HOW} — or turn on auto-update once: /plugin → Marketplaces → theshyre → Enable auto-update.`
       : (agent === "codex" || agent === "cursor") && selfUpdateSkipReason(readConfig(env), { publicKeyPems: signingKeys, runningPath: selfPath(), installedPath: installedRuntimePath(), env }) === null
         ? (() => {
             const last = readSelfUpdateState();
@@ -3991,7 +4002,7 @@ export function tokenRefusalNotice(): string | null {
 export function upgradeRequiredNotice(agent: Agent = "claude"): string | null {
   const state = readUpgradeRequiredState();
   if (!state) return null;
-  const how = agent === "claude" ? "Run /plugin update shyre@theshyre, then /reload-plugins." : "Run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature.";
+  const how = agent === "claude" ? `To update, ${CLAUDE_UPDATE_HOW}.` : "Run node ~/.shyre/bin/shyre-hook.mjs update, which verifies the release's signature.";
   return `Shyre is refusing hook ${VERSION} as too old${state.minVersion ? ` (it needs ${state.minVersion} or newer)` : ""}, since ${state.since}. Nothing is lost if you update within ${DROP_GIVE_UP_DAYS} days: every run is kept on this machine and is delivered after the update. ${how} Tell the person.`;
 }
 
@@ -4736,7 +4747,7 @@ export async function doctorLines(cfg: Config, cwd: string = process.cwd(), prob
     const newest = newestKnownVersion();
     if (!newest) return "latest: unknown — no sweep has asked the server yet, and no marketplace clone was found";
     return isNewerVersion(newest.version, VERSION)
-      ? `latest: ${newest.version} (per ${newest.source}) — this copy is ${VERSION}; see plugin-update and self-update above, or run /plugin update shyre@theshyre`
+      ? `latest: ${newest.version} (per ${newest.source}) — this copy is ${VERSION}; see plugin-update and self-update above, or ${CLAUDE_UPDATE_HOW}`
       : `latest: this copy (${VERSION}) is the newest anything here knows of`;
   });
   attempt("log", () => {
