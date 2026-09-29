@@ -4,6 +4,21 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.14.0 — 2026-09-29
+
+- **Leftover session time joins the entry beside it on a sub-project.** A
+  repository usually maps to the umbrella project, while the agent logs each
+  unit on the deliverable nested under it. The kit only folded leftover
+  minutes into entries on the mapped project itself, so it found nothing
+  beside them, held them a day, and posted them as an uncategorized,
+  ticketless "recorded a day later" entry on the umbrella. It now folds into
+  the agent's entry on the mapped project **or any project nested under it**,
+  so those minutes land on the unit they belong to — its category, ticket and
+  project — the same day. A project outside that tree is still a parallel
+  session and is never folded into. Needs Shyre's projects list to name each
+  project's parent (live with this release); against an older server the kit
+  behaves as 1.13.0 did.
+
 ## 1.13.0 — 2026-09-29
 
 - **Time the kit logs for you says what the work was.** When a session's time

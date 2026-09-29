@@ -125,7 +125,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.13.0";
+export const VERSION = "1.14.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -1976,6 +1976,9 @@ interface ProjectRow {
   github_repo: string | null;
   /** `active`, `paused`, `completed`, `archived`; null when the server did not say. */
   status: string | null;
+  /** The parent project on the same team; null for a top-level project, or
+   *  from a server older than 20260929130000, which did not name it. */
+  parent_project_id: string | null;
 }
 
 /** Shared across one sweep: one projects lookup per flush, not per item. */
@@ -2001,6 +2004,7 @@ function toProjectRows(value: unknown): ProjectRow[] | null {
       id: entry.id,
       github_repo: typeof entry.github_repo === "string" ? entry.github_repo : null,
       status: typeof entry.status === "string" ? entry.status : null,
+      parent_project_id: typeof entry.parent_project_id === "string" ? entry.parent_project_id : null,
     });
   }
   return rows;
@@ -2218,7 +2222,7 @@ export async function deliver(item: SpoolItem, cfg: Config, projectsCache: Proje
   const coverage = await fetchCoverage(item, cfg, tag);
   // A backfill is an explicit command over days that may have no entries at
   // all; it posts as it always did. A live run folds.
-  if (cfg.fold === true && !item.backfilled) return foldRun(item, cfg, projectId, tag, coverage, ws, we);
+  if (cfg.fold === true && !item.backfilled) return foldRun(item, cfg, projectId, projectFamily(projectsCache.list, projectId), tag, coverage, ws, we);
   let segments: Segment[] = [[isoSeconds(ws), isoSeconds(we)]];
   if (coverage.complete) {
     segments = uncoveredSegments(coverage.entries, item.start_time, item.end_time);
@@ -2322,6 +2326,45 @@ export const FOLD_HOLD_HOURS = 24;
 /** A held stretch shorter than this is not posted as its own entry when the hold ends; it is reported. */
 export const HELD_POST_MIN_SECONDS = 120;
 
+/**
+ * The project a run maps to and every project nested under it (1.14.0).
+ *
+ * ⚠️ A REPO MAPS TO THE UMBRELLA; AGENTS LOG ON THE DELIVERABLE. The map (or
+ * `github_repo`) names one project, and the agent logs each unit on the
+ * sub-project the work is for. Folding only into entries on the mapped
+ * project found nothing beside those units, so on 2026-09-27 an AVDR
+ * session's leftover minutes were held a day and landed as three
+ * uncategorized, ticketless rows on the umbrella — beside the very AE-619
+ * entries they belonged to. The family is where a fold may land. A list the
+ * server did not send, or one without parents (an older server), leaves the
+ * mapped project alone: the 1.13 behavior, never a guess.
+ */
+export function projectFamily(list: ReadonlyArray<Pick<ProjectRow, "id" | "parent_project_id">> | undefined, projectId: string): Set<string> {
+  const family = new Set([projectId]);
+  if (!list) return family;
+  // Walk down until nothing new joins: a grandchild counts, and a cycle (which
+  // the schema refuses) cannot loop.
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const p of list) {
+      if (p.parent_project_id !== null && family.has(p.parent_project_id) && !family.has(p.id)) {
+        family.add(p.id);
+        grew = true;
+      }
+    }
+  }
+  return family;
+}
+
+/** A project id, or the set a fold may land in. */
+type ProjectScope = string | ReadonlySet<string>;
+
+function inScope(scope: ProjectScope, projectId: unknown): boolean {
+  if (typeof projectId !== "string") return false;
+  return typeof scope === "string" ? projectId === scope : scope.has(projectId);
+}
+
 /** The entry an uncovered stretch extends, and which edge moves. */
 export interface FoldTarget {
   entry: Record<string, unknown>;
@@ -2336,7 +2379,7 @@ export interface FoldTarget {
  * hand-typed entry is never stretched by a hook. Both are returned because
  * the first may belong to a parallel session on the same project and refuse.
  */
-export function foldTargets(entries: unknown, projectId: string, segStart: string, segEnd: string): FoldTarget[] {
+export function foldTargets(entries: unknown, projectId: ProjectScope, segStart: string, segEnd: string): FoldTarget[] {
   if (!Array.isArray(entries)) return [];
   const s = Date.parse(segStart);
   const e = Date.parse(segEnd);
@@ -2345,7 +2388,7 @@ export function foldTargets(entries: unknown, projectId: string, segStart: strin
   let after: { entry: Record<string, unknown>; start: number } | null = null;
   for (const row of entries as unknown[]) {
     if (!isRecord(row)) continue;
-    if (typeof row.id !== "string" || row.project_id !== projectId) continue;
+    if (typeof row.id !== "string" || !inScope(projectId, row.project_id)) continue;
     if (row.started_by_kind !== "agent" || row.invoiced === true) continue;
     if (typeof row.start_time !== "string" || typeof row.end_time !== "string") continue;
     const rs = Date.parse(row.start_time);
@@ -2361,7 +2404,7 @@ export function foldTargets(entries: unknown, projectId: string, segStart: strin
 }
 
 /** The first of `foldTargets`, or null. */
-export function foldTarget(entries: unknown, projectId: string, segStart: string, segEnd: string): FoldTarget | null {
+export function foldTarget(entries: unknown, projectId: ProjectScope, segStart: string, segEnd: string): FoldTarget | null {
   return foldTargets(entries, projectId, segStart, segEnd)[0] ?? null;
 }
 
@@ -2372,12 +2415,12 @@ export function foldTarget(entries: unknown, projectId: string, segStart: string
  * Another project's entry does not close it — that is a parallel session,
  * and this session's unit may still be open beside it.
  */
-export function closedOnTheRight(entries: unknown, projectId: string, segEnd: string): boolean {
+export function closedOnTheRight(entries: unknown, projectId: ProjectScope, segEnd: string): boolean {
   if (!Array.isArray(entries)) return false;
   const e = Date.parse(segEnd);
   // An AGENT entry: a hand-typed meeting starting at that instant says nothing
   // about whether the agent's unit was logged.
-  return (entries as unknown[]).some((row) => isRecord(row) && row.project_id === projectId && row.started_by_kind === "agent" && typeof row.start_time === "string" && Math.abs(Date.parse(row.start_time) - e) <= FOLD_SLACK_MS);
+  return (entries as unknown[]).some((row) => isRecord(row) && inScope(projectId, row.project_id) && row.started_by_kind === "agent" && typeof row.start_time === "string" && Math.abs(Date.parse(row.start_time) - e) <= FOLD_SLACK_MS);
 }
 
 /** How long a session's marks file may sit unwritten and still count as an
@@ -2400,8 +2443,8 @@ export function sessionStillOpen(agent: string, sessionId: string, nowMs: number
 
 /**
  * Deliver a live run by folding (1.9.0): every uncovered stretch extends an
- * adjacent agent entry on the run's project, and nothing is posted as an
- * entry of its own.
+ * adjacent agent entry on the run's project or one nested under it (1.14.0),
+ * and nothing is posted as an entry of its own.
  *
  * ⚠️ NOT THE UNIT STILL IN PROGRESS. While the session is still open, a
  * stretch with nothing logged after it is the work the agent has not logged
@@ -2419,7 +2462,7 @@ export function sessionStillOpen(agent: string, sessionId: string, nowMs: number
  * stretches under HELD_POST_MIN_SECONDS are reported as dropped. Coverage that cannot be read keeps the run: folding without seeing
  * the entries is guessing.
  */
-async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: string, coverage: Coverage, ws: number, we: number): Promise<boolean> {
+async function foldRun(item: SpoolItem, cfg: Config, projectId: string, family: ReadonlySet<string>, tag: string, coverage: Coverage, ws: number, we: number): Promise<boolean> {
   if (!coverage.complete) {
     logRefusal(`${tag}\t${coverage.reason}; kept: a fold must see the entries it extends`);
     return false;
@@ -2440,11 +2483,17 @@ async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: str
     if (done.has(key)) continue;
     const span = Date.parse(segEnd) - Date.parse(segStart);
     const minutes = Math.round(span / 60000);
+    // ⚠️ THE MAPPED PROJECT, NOT THE FAMILY. A sibling sub-project's entry
+    // starting here is as likely a parallel session (another worktree, another
+    // ticket) as this session's next unit; counting it would fold a live
+    // session's unit in progress into its previous entry — the 1.9 bug this
+    // hold exists for. A live stretch between sub-project units waits for the
+    // session to stop, then folds into the family.
     if (moving && !closedOnTheRight(entries, projectId, segEnd)) {
       inProgressMs += span;
       continue;
     }
-    const targets = foldTargets(entries, projectId, segStart, segEnd);
+    const targets = foldTargets(entries, family, segStart, segEnd);
     if (targets.length === 0) {
       unplaced.push([segStart, segEnd]);
       continue;
@@ -2509,7 +2558,7 @@ async function foldRun(item: SpoolItem, cfg: Config, projectId: string, tag: str
     const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
     const heldSince = Number.isFinite(createdMs) ? Math.max(createdMs, we) : we;
     if ((Date.now() - heldSince) / 3_600_000 < FOLD_HOLD_HOURS) {
-      logRefusal(`${tag}\t${minutes} min have no agent entry on this project to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
+      logRefusal(`${tag}\t${minutes} min have no agent entry on this project or its sub-projects to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
       return false;
     }
     // THE HOLD IS A DELAY, NOT A DROP (1.9.1). 1.9.0 reported these stretches

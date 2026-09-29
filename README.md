@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.13.0 (2026-09-29) — see `CHANGELOG.md`.
+**Latest release:** 1.14.0 (2026-09-29) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins

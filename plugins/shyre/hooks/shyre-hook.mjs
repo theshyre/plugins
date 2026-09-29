@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.13.0";
+var VERSION = "1.14.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -1201,7 +1201,8 @@ function toProjectRows(value) {
     rows.push({
       id: entry.id,
       github_repo: typeof entry.github_repo === "string" ? entry.github_repo : null,
-      status: typeof entry.status === "string" ? entry.status : null
+      status: typeof entry.status === "string" ? entry.status : null,
+      parent_project_id: typeof entry.parent_project_id === "string" ? entry.parent_project_id : null
     });
   }
   return rows;
@@ -1324,7 +1325,7 @@ async function deliver(item, cfg, projectsCache = {}) {
     logRefusal(`${tag}	note: the project this repo maps to (${projectId}) is completed; posting anyway \u2014 if the work moved on, point ~/.shyre/projects.json at it`);
   }
   const coverage = await fetchCoverage(item, cfg, tag);
-  if (cfg.fold === true && !item.backfilled) return foldRun(item, cfg, projectId, tag, coverage, ws, we);
+  if (cfg.fold === true && !item.backfilled) return foldRun(item, cfg, projectId, projectFamily(projectsCache.list, projectId), tag, coverage, ws, we);
   let segments = [[isoSeconds(ws), isoSeconds(we)]];
   if (coverage.complete) {
     segments = uncoveredSegments(coverage.entries, item.start_time, item.end_time);
@@ -1398,6 +1399,25 @@ function buildFoldBody(item, segStart, segEnd, whole) {
 var FOLD_SLACK_MS = 60 * 1e3;
 var FOLD_HOLD_HOURS = 24;
 var HELD_POST_MIN_SECONDS = 120;
+function projectFamily(list, projectId) {
+  const family = /* @__PURE__ */ new Set([projectId]);
+  if (!list) return family;
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const p of list) {
+      if (p.parent_project_id !== null && family.has(p.parent_project_id) && !family.has(p.id)) {
+        family.add(p.id);
+        grew = true;
+      }
+    }
+  }
+  return family;
+}
+function inScope(scope, projectId) {
+  if (typeof projectId !== "string") return false;
+  return typeof scope === "string" ? projectId === scope : scope.has(projectId);
+}
 function foldTargets(entries, projectId, segStart, segEnd) {
   if (!Array.isArray(entries)) return [];
   const s = Date.parse(segStart);
@@ -1407,7 +1427,7 @@ function foldTargets(entries, projectId, segStart, segEnd) {
   let after = null;
   for (const row of entries) {
     if (!isRecord(row)) continue;
-    if (typeof row.id !== "string" || row.project_id !== projectId) continue;
+    if (typeof row.id !== "string" || !inScope(projectId, row.project_id)) continue;
     if (row.started_by_kind !== "agent" || row.invoiced === true) continue;
     if (typeof row.start_time !== "string" || typeof row.end_time !== "string") continue;
     const rs = Date.parse(row.start_time);
@@ -1427,7 +1447,7 @@ function foldTarget(entries, projectId, segStart, segEnd) {
 function closedOnTheRight(entries, projectId, segEnd) {
   if (!Array.isArray(entries)) return false;
   const e = Date.parse(segEnd);
-  return entries.some((row) => isRecord(row) && row.project_id === projectId && row.started_by_kind === "agent" && typeof row.start_time === "string" && Math.abs(Date.parse(row.start_time) - e) <= FOLD_SLACK_MS);
+  return entries.some((row) => isRecord(row) && inScope(projectId, row.project_id) && row.started_by_kind === "agent" && typeof row.start_time === "string" && Math.abs(Date.parse(row.start_time) - e) <= FOLD_SLACK_MS);
 }
 var OPEN_SESSION_STALE_MS = 6 * 36e5;
 function sessionStillOpen(agent, sessionId, nowMs) {
@@ -1439,7 +1459,7 @@ function sessionStillOpen(agent, sessionId, nowMs) {
     return false;
   }
 }
-async function foldRun(item, cfg, projectId, tag, coverage, ws, we) {
+async function foldRun(item, cfg, projectId, family, tag, coverage, ws, we) {
   if (!coverage.complete) {
     logRefusal(`${tag}	${coverage.reason}; kept: a fold must see the entries it extends`);
     return false;
@@ -1464,7 +1484,7 @@ async function foldRun(item, cfg, projectId, tag, coverage, ws, we) {
       inProgressMs += span;
       continue;
     }
-    const targets = foldTargets(entries, projectId, segStart, segEnd);
+    const targets = foldTargets(entries, family, segStart, segEnd);
     if (targets.length === 0) {
       unplaced.push([segStart, segEnd]);
       continue;
@@ -1521,7 +1541,7 @@ async function foldRun(item, cfg, projectId, tag, coverage, ws, we) {
     const createdMs = item.created ? Date.parse(item.created) : Number.NaN;
     const heldSince = Number.isFinite(createdMs) ? Math.max(createdMs, we) : we;
     if ((Date.now() - heldSince) / 36e5 < FOLD_HOLD_HOURS) {
-      logRefusal(`${tag}	${minutes} min have no agent entry on this project to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
+      logRefusal(`${tag}	${minutes} min have no agent entry on this project or its sub-projects to fold into yet: held (up to ${FOLD_HOLD_HOURS} h)`);
       return false;
     }
     const tiny = [];
@@ -3361,6 +3381,7 @@ export {
   pluginUpdatePath,
   pluginUpdateSkipReason,
   probeLatestVersion,
+  projectFamily,
   prometheusPort,
   promptMarksFor,
   readConfig,
