@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.12.0 (2026-09-18) — see `CHANGELOG.md`.
+**Latest release:** 1.13.0 (2026-09-29) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -75,8 +75,8 @@ first so one set of hooks runs.
   `/settings/integrations` to re-mint it. `doctor` shows the same streak.
 - **The MCP server signs in through the browser.** The first Shyre tool a
   session uses opens a tab, you pick the team and click Allow, and the agent
-  holds a token nobody typed — fifteen tools, from "start a timer" to "draft
-  the release notes". The hooks have no browser, so they read
+  holds a token nobody typed — nineteen tools, from "start a timer" to "draft
+  the release notes" and "draft a proposal". The hooks have no browser, so they read
   `SHYRE_API_KEY` from the shell that launches `claude`.
 - **`log-your-time`**, the skill: how an agent logs a categorized,
   invoice-ready entry at the end of a unit of work — and, in Claude Code, a

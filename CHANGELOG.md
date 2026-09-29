@@ -4,6 +4,27 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.13.0 — 2026-09-29
+
+- **Time the kit logs for you says what the work was.** When a session's time
+  reaches Shyre without an entry the agent wrote — posted a day later, or in
+  post mode — its description is now the subjects of the commits you made in
+  that window ("AE-797: capture audit timestamps; fix the CSV export"),
+  instead of "Claude Code session — active time (idle gaps excluded)". A
+  ticket key in a commit links the entry. With no commits in the window the
+  sentence stays as before. Only the subjects of commits **you** authored in
+  that window are read (by author date, so a rebase doesn't move them) —
+  text you already published in your history, never a prompt, never a
+  colleague's commit — and they can reach an invoice line as written. This
+  applies to posted, day-late and backfilled time alike. The `git log` it
+  runs never fetches and never runs a program a repository's config names
+  (a signature check, a pager, a partial clone's promisor remote).
+- **A post the server merged into your previous entry counts as posted**,
+  instead of being retried as a failed replay.
+- **And it lands in a category.** Shyre now files a log that names no
+  category, on a project with no default, under the category you used last
+  on that project (server-side; it applies to every agent's log).
+
 ## 1.12.0 — 2026-09-18
 
 - **An open session runs a new release without being reloaded (Claude

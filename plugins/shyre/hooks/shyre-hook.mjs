@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.12.0";
+var VERSION = "1.13.0";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
   codex: "Codex",
@@ -323,7 +323,7 @@ function buildEntryBody(item) {
     // A description can end up on an invoice line a client reads, so it says
     // what the time IS and nothing about where to look ("see transcript" sent
     // a client looking for something they cannot see).
-    description: item.backfilled ? `${item.label} session \u2014 backfilled from local history after the fact; active time (idle gaps excluded)` : item.held ? `${item.label} session \u2014 active time (idle gaps excluded); recorded a day later because no entry was logged for it` : `${item.label} session \u2014 active time (idle gaps excluded)`,
+    description: item.work_summary ? item.work_summary : item.backfilled ? `${item.label} session \u2014 backfilled from local history after the fact; active time (idle gaps excluded)` : item.held ? `${item.label} session \u2014 active time (idle gaps excluded); recorded a day later because no entry was logged for it` : `${item.label} session \u2014 active time (idle gaps excluded)`,
     agent_label: item.label,
     session_ref: item.session_ref,
     idempotency_key: item.idempotency_key,
@@ -551,6 +551,46 @@ function gitRemote(cwd, env = process.env) {
     }
   }
   return null;
+}
+function commitSubjects(cwd, start, end, env = process.env) {
+  const clean = { ...env };
+  for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete clean[k];
+  const gitEnv = { ...clean, GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+  const guards = ["-c", "core.fsmonitor=", "-c", "log.showSignature=false", "-c", "gpg.program=false", "--no-pager", "-C", cwd];
+  const opts = { encoding: "utf8", timeout: 3e3, stdio: ["ignore", "pipe", "ignore"], windowsHide: true, env: gitEnv };
+  let out;
+  let me;
+  try {
+    me = execFileSync("git", [...guards, "config", "user.email"], opts).trim().toLowerCase();
+    out = execFileSync(
+      "git",
+      // AUTHOR date, filtered here: git's --since/--until read the committer
+      // date, which a rebase or amend moves to today — yesterday's work would
+      // then describe today's window. The newest 200 are more than a window
+      // holds; a window older than that falls back to the stock sentence.
+      [...guards, "log", "--no-merges", "--no-color", "--format=%at%x09%ae%x09%s", "-n", "200"],
+      opts
+    );
+  } catch {
+    return void 0;
+  }
+  if (!me) return void 0;
+  const from = Date.parse(start) / 1e3;
+  const to = Date.parse(end) / 1e3;
+  const subjects = [];
+  for (const line of out.split("\n").reverse()) {
+    const [ct, author, ...rest] = line.split("	");
+    if (ct === void 0 || author === void 0 || rest.length === 0) continue;
+    const at = Number(ct);
+    if (!Number.isFinite(at) || at < from || at >= to) continue;
+    if (author.trim().toLowerCase() !== me) continue;
+    const subject = rest.join("	").replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
+    if (subject && !subjects.includes(subject)) subjects.push(subject);
+  }
+  if (subjects.length === 0) return void 0;
+  let joined = subjects.join("; ");
+  if (joined.length > 600) joined = `${joined.slice(0, 597).replace(/;?\s*\S*$/, "")}\u2026`;
+  return joined.length >= 8 ? joined : void 0;
 }
 function mapFileCandidates() {
   return [join(shyreHome(), "projects.json"), join(homedir(), ".claude", "shyre-projects.json")];
@@ -1550,6 +1590,7 @@ async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we, 
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : void 0,
       backfilled: item.backfilled === true,
       held,
+      work_summary: item.cwd ? commitSubjects(item.cwd, start, segEnd) : void 0,
       // A split run's tokens cannot be apportioned to one of its segments;
       // only the whole run carries them.
       agent_tokens: whole ? item.agent_tokens : void 0
@@ -1566,8 +1607,10 @@ async function postSegment(item, cfg, projectId, tag, segStart, segEnd, ws, we, 
         logRefusal(`${tag}	${res.status} without an entry body, kept for retry`);
         return "kept";
       }
+      if (res.json.continued === true) return "posted";
       const gotStart = typeof res.json.start_time === "string" ? Date.parse(res.json.start_time) : Number.NaN;
       const gotEnd = typeof res.json.end_time === "string" ? Date.parse(res.json.end_time) : Number.NaN;
+      if (Number.isFinite(gotStart) && Number.isFinite(gotEnd) && gotStart <= Date.parse(start) + 1e3 && gotEnd >= Date.parse(segEnd) - 1e3) return "posted";
       if (Number.isFinite(gotStart) && Number.isFinite(gotEnd) && (Math.abs(gotStart - Date.parse(start)) > 1e3 || Math.abs(gotEnd - Date.parse(segEnd)) > 1e3)) {
         logRefusal(`${tag}	${res.status} replayed an existing entry with a different window (${res.json.start_time}..${res.json.end_time}); ${start}..${segEnd} kept for retry`);
         return "kept";
@@ -3270,6 +3313,7 @@ export {
   cmdInstall,
   cmdStart,
   cmdUpdate,
+  commitSubjects,
   cursorHooks,
   deliver,
   detectAgent,

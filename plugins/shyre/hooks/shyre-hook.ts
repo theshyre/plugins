@@ -125,7 +125,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.12.0";
+export const VERSION = "1.13.0";
 
 /** Agent id → what the entry's `agent_label` says. */
 export const AGENT_LABELS = Object.freeze({
@@ -306,6 +306,10 @@ export interface EntryBodyInput {
   backfilled?: boolean | undefined;
   /** Posted because nothing was logged beside it within the day's hold (1.9.1) — said in the description, so an entry that turns up a day late on a day already reviewed explains itself. */
   held?: boolean | undefined;
+  /** What the window's work WAS, when the repository says: the subjects of
+   *  the commits made in it (1.13.0). Replaces the stock sentence, which told
+   *  the person reviewing the day nothing about four entries on 2026-09-29. */
+  work_summary?: string | undefined;
   agent_tokens?: AgentTokens | undefined;
 }
 
@@ -574,7 +578,9 @@ export function buildEntryBody(item: EntryBodyInput): EntryBody {
     // A description can end up on an invoice line a client reads, so it says
     // what the time IS and nothing about where to look ("see transcript" sent
     // a client looking for something they cannot see).
-    description: item.backfilled
+    description: item.work_summary
+      ? item.work_summary
+      : item.backfilled
       ? `${item.label} session — backfilled from local history after the fact; active time (idle gaps excluded)`
       : item.held
         ? `${item.label} session — active time (idle gaps excluded); recorded a day later because no entry was logged for it`
@@ -942,6 +948,71 @@ export function gitRemote(cwd: string, env: NodeJS.ProcessEnv = process.env): st
     }
   }
   return null;
+}
+
+/**
+ * The subjects of the commits made in `cwd`'s repository inside
+ * [start, end), oldest first, de-duplicated, joined with "; " and capped — or
+ * undefined when there are none (or git is not there). It is text the person
+ * already published in their history, never a prompt, and a ticket key in it
+ * links the entry on the server.
+ *
+ * ⚠️ `git log` over a repository the person may not trust. Same guards as
+ * gitRemote, plus what a log can reach:
+ *   · a signature program (log.showSignature + gpg.program) — both pinned;
+ *   · a LAZY FETCH: a partial-clone repository whose tip commit is missing
+ *     asks its promisor remote for it, and that remote's uploadpack /
+ *     sshCommand / credential helper is a program the repository names —
+ *     executed in review (SAL-277) with every other guard in place. Remote
+ *     names are arbitrary, so the keys cannot be pinned; instead the child
+ *     may not fetch at all (GIT_NO_LAZY_FETCH, git 2.44+) and may use no
+ *     transport (GIT_ALLOW_PROTOCOL=none, for the older git macOS ships);
+ *   · no pager (stdio is piped and --no-pager is explicit), no diff, no
+ *     textconv (subjects only).
+ * Only the person's own commits count (author email = their user.email): a
+ * colleague's commit pulled into the window is not their work.
+ */
+export function commitSubjects(cwd: string, start: string, end: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const clean: NodeJS.ProcessEnv = { ...env };
+  for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"]) delete clean[k];
+  const gitEnv = { ...clean, GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+  const guards = ["-c", "core.fsmonitor=", "-c", "log.showSignature=false", "-c", "gpg.program=false", "--no-pager", "-C", cwd];
+  const opts = { encoding: "utf8" as const, timeout: 3000, stdio: ["ignore", "pipe", "ignore"] as ["ignore", "pipe", "ignore"], windowsHide: true, env: gitEnv };
+  let out: string;
+  let me: string;
+  try {
+    me = execFileSync("git", [...guards, "config", "user.email"], opts).trim().toLowerCase();
+    out = execFileSync(
+      "git",
+      // AUTHOR date, filtered here: git's --since/--until read the committer
+      // date, which a rebase or amend moves to today — yesterday's work would
+      // then describe today's window. The newest 200 are more than a window
+      // holds; a window older than that falls back to the stock sentence.
+      [...guards, "log", "--no-merges", "--no-color", "--format=%at%x09%ae%x09%s", "-n", "200"],
+      opts,
+    );
+  } catch {
+    return undefined;
+  }
+  if (!me) return undefined;
+  const from = Date.parse(start) / 1000;
+  const to = Date.parse(end) / 1000;
+  const subjects: string[] = [];
+  for (const line of out.split("\n").reverse()) {
+    const [ct, author, ...rest] = line.split("\t");
+    if (ct === undefined || author === undefined || rest.length === 0) continue;
+    const at = Number(ct);
+    // --since/--until are inclusive and git reads them loosely; the window is exact.
+    if (!Number.isFinite(at) || at < from || at >= to) continue;
+    if (author.trim().toLowerCase() !== me) continue;
+    // Control characters (C0, DEL, C1) and bidi overrides never reach a description.
+    const subject = rest.join("\t").replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
+    if (subject && !subjects.includes(subject)) subjects.push(subject);
+  }
+  if (subjects.length === 0) return undefined;
+  let joined = subjects.join("; ");
+  if (joined.length > 600) joined = `${joined.slice(0, 597).replace(/;?\s*\S*$/, "")}…`;
+  return joined.length >= 8 ? joined : undefined;
 }
 
 /** The map files, in the order they are consulted. */
@@ -2544,6 +2615,7 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
       prompt_marks: item.marks ? promptMarksFor(item.marks, start, segEnd) : undefined,
       backfilled: item.backfilled === true,
       held,
+      work_summary: item.cwd ? commitSubjects(item.cwd, start, segEnd) : undefined,
       // A split run's tokens cannot be apportioned to one of its segments;
       // only the whole run carries them.
       agent_tokens: whole ? item.agent_tokens : undefined,
@@ -2562,10 +2634,16 @@ async function postSegment(item: SpoolItem, cfg: Config, projectId: string, tag:
         logRefusal(`${tag}\t${res.status} without an entry body, kept for retry`);
         return "kept";
       }
+      // The server extended an earlier entry with this stretch (continuation,
+      // 20260928120000): the window is that entry's, and the stretch landed.
+      if (res.json.continued === true) return "posted";
       // A 2xx whose entry is a DIFFERENT window is the server replaying an
       // earlier post under the same key — this stretch did not land.
       const gotStart = typeof res.json.start_time === "string" ? Date.parse(res.json.start_time) : Number.NaN;
       const gotEnd = typeof res.json.end_time === "string" ? Date.parse(res.json.end_time) : Number.NaN;
+      // A replayed merge (its first reply was lost) comes back without the
+      // flag, as the earlier entry grown to cover this stretch: it landed.
+      if (Number.isFinite(gotStart) && Number.isFinite(gotEnd) && gotStart <= Date.parse(start) + 1000 && gotEnd >= Date.parse(segEnd) - 1000) return "posted";
       if (Number.isFinite(gotStart) && Number.isFinite(gotEnd) && (Math.abs(gotStart - Date.parse(start)) > 1000 || Math.abs(gotEnd - Date.parse(segEnd)) > 1000)) {
         logRefusal(`${tag}\t${res.status} replayed an existing entry with a different window (${res.json.start_time}..${res.json.end_time}); ${start}..${segEnd} kept for retry`);
         return "kept";
