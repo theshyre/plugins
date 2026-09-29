@@ -56,8 +56,16 @@ no note; the rule above is the whole control there.
      over 15 minutes. **`end_time` may never be later than the clock**: read
      the current time first and treat it as the ceiling; if your estimate
      overshoots, shorten the entry rather than sliding `start_time` later.
-     Never round `start_time` down to the minute; when logging back to back,
-     copy the previous entry's `end_time` verbatim as the new start.
+     **`start_time` is when THIS unit's work began** — the first prompt or
+     tool call for it — never "where the last entry ended". Copy the previous
+     entry's `end_time` verbatim ONLY when the work was genuinely contiguous
+     (no gap over 15 minutes); then it avoids a 409 over trailing seconds.
+     After any break, start at the first activity after it: a start copied
+     across a break claims the whole break as work, and the server cannot
+     tell. Never round `start_time` down to the minute. After you log, the
+     hook compares the window with this session's activity and tells you
+     when part of it had none, with the correction; make it, unless the
+     work really did happen (a long build, another session on this unit).
    - `description` — one concise line of outcome, leading with the ticket key
      when there is one.
    - `agent_label` — this agent's name (`Claude Code`, `Codex`, `Cursor`,

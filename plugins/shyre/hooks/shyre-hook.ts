@@ -125,7 +125,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.14.1";
+export const VERSION = "1.15.0";
 
 /**
  * How a person updates the Claude Code plugin by hand.
@@ -1392,6 +1392,7 @@ export function cmdStart(argvAgent: string, payload: unknown, announce = false):
     writeAtomic(`${base}.meta.json`, JSON.stringify(meta), 0o600);
   }
   appendLine(`${base}.marks`, `${nowIso()} start\n`);
+  appendLine(`${base}${ACTIVITY_EXT}`, `${nowIso()} start\n`);
   // SessionStart stdout is added to the agent's context; this is how the
   // person finds out a newer runtime exists without watching a marketplace.
   // Only on the real SessionStart — a beat that creates state lazily is a
@@ -1525,6 +1526,135 @@ export function logNudge(agent: Agent, session: string, base: string, payload: u
   return say ? nudgeNotice(Math.round(step.state.activeMs / 60_000), thresholdMinutes) : null;
 }
 
+// ─── The idle-window note (1.15.0) ───────────────────────────────────────────
+//
+// Agents were told to start an entry at the previous entry's end so two
+// back-to-back entries touch instead of 409ing, and they applied it across
+// breaks too: an entry logged at noon for a unit begun at 11:50 claimed 09:27
+// onward because that was where the last one ended. Touching windows are
+// legal, so the server took every one — 296 of 1,114 minutes on one AVDR
+// project (2026-09-29), and the cross-project split then handed half of those
+// idle minutes' neighbors away. The server cannot see idleness; this hook can:
+// it has a mark for every prompt and tool call of the session. So right after
+// an entry is written, the window is laid over the marks, and a stretch with
+// none — longer than the idle cap, the same bar the session-end backstop uses
+// to cut its own runs — goes back to the agent with the correction to make.
+// Advisory: a single tool that ran longer than the cap leaves a gap too, and
+// the agent is the one who knows.
+
+/**
+ * ⚠️ NOT `.marks`. A checkpoint rewrites the marks file to hold only what it
+ * has not yet spooled, so after the first cut (every 30 minutes of a busy
+ * session, by default) the marks say nothing about the morning — and laying a
+ * window over them called four hours of real work idle (review, 2026-09-29).
+ * This log is append-only: one line per beat, never cut, removed with the
+ * session's other files.
+ */
+export const ACTIVITY_EXT = ".activity";
+
+/** A stretch of an entry's window that this session recorded nothing in. */
+export interface IdleStretch {
+  from: number;
+  to: number;
+}
+
+/**
+ * The window's idle stretches: every gap longer than `capMs` between the
+ * window's start, the session's marks inside it, and its end. A window with
+ * no marks inside it at all is one stretch.
+ */
+export function idleStretches(marks: readonly Mark[], startMs: number, endMs: number, capMs: number): IdleStretch[] {
+  if (!(endMs > startMs)) return [];
+  const points = [startMs, ...marks.map((m) => m.t).filter((t) => t > startMs && t < endMs).sort((a, b) => a - b), endMs];
+  const out: IdleStretch[] = [];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    if (a !== undefined && b !== undefined && b - a > capMs) out.push({ from: a, to: b });
+  }
+  return out;
+}
+
+/** The written entry, read from what the tool call returned. */
+export interface WrittenWindow {
+  id: string | null;
+  startMs: number;
+  endMs: number;
+}
+
+const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/** `"key":"value"` in JSON, or in JSON escaped once inside a JSON string. */
+function jsonField(text: string, key: string): string | null {
+  const m = new RegExp(`\\\\?"${key}\\\\?"\\s*:\\s*\\\\?"([^"\\\\]+)`).exec(text);
+  return m?.[1] ?? null;
+}
+
+/**
+ * The entry a `logged` tool call wrote, or null when it wrote none (an error
+ * answer, or output too clipped to name the window). The RESPONSE is read, not
+ * the request: the server's row is the truth, and a shell body such as
+ * `"end_time":"$END"` is not a time. The request's start is the fallback only
+ * when the response was clipped before it (`| head -c 300`), and the end then
+ * defaults to now — the server refuses a later one anyway.
+ */
+export function writtenWindow(payload: unknown, now: number): WrittenWindow | null {
+  const p = isRecord(payload) ? payload : {};
+  const response = typeof p.tool_response === "string" ? p.tool_response : JSON.stringify(p.tool_response ?? "");
+  // A refusal (409, 400) can name another entry's id; it wrote nothing.
+  if (/\\?"error\\?"\s*:/.test(response)) return null;
+  const idRaw = jsonField(response, "id");
+  const id = idRaw !== null && UUID.test(idRaw) ? idRaw : null;
+  if (id === null) return null;
+  const request = JSON.stringify(p.tool_input ?? "");
+  const startRaw = jsonField(response, "start_time") ?? jsonField(request, "start_time");
+  const endRaw = jsonField(response, "end_time");
+  const startMs = startRaw === null ? NaN : Date.parse(startRaw);
+  const parsedEnd = endRaw === null ? NaN : Date.parse(endRaw);
+  if (!Number.isFinite(startMs)) return null;
+  return { id, startMs, endMs: Number.isFinite(parsedEnd) ? parsedEnd : now };
+}
+
+export function idleNotice(win: WrittenWindow, idle: readonly IdleStretch[]): string {
+  const minutes = (ms: number): number => Math.round(ms / 60_000);
+  const total = minutes(idle.reduce((sum, s) => sum + (s.to - s.from), 0));
+  const listed = idle.map((s) => `${isoSeconds(s.from)} → ${isoSeconds(s.to)} (${minutes(s.to - s.from)} min)`).join("; ");
+  const lead = idle[0]?.from === win.startMs ? idle[0] : undefined;
+  const target = win.id === null ? "the entry" : `entry ${win.id}`;
+  const fix = lead && idle.length === 1
+    ? `If that time was not work on this unit, move the start: PATCH /api/v1/entries/${win.id ?? "<id>"} with start_time ${isoSeconds(lead.to)} (or update_time_entry).`
+    : `If that time was not work on this unit, shorten the entry to its active minutes (PATCH /api/v1/entries/${win.id ?? "<id>"} start_time/end_time, or update_time_entry), or split it around the gap.`;
+  return `Shyre: ${target} you just logged runs ${isoSeconds(win.startMs)} → ${isoSeconds(win.endMs)}, but this session recorded no activity for ${total} min of it: ${listed}. An entry is active work on this unit, not elapsed time — a start copied from the previous entry's end claims every break in between. ${fix} If the work did happen (a long build, work in another session on this same unit), leave it.`;
+}
+
+/**
+ * The note for a `logged` tool call whose window holds a stretch this session
+ * recorded nothing in, or null. Claude Code only, for the same reason as the
+ * log-your-time note.
+ */
+export function idleWindowNote(agent: Agent, base: string, payload: unknown, now: number, capSeconds: number): string | null {
+  if (agent !== "claude" || toolSignal(payload) !== "logged") return null;
+  const win = writtenWindow(payload, now);
+  if (win === null) return null;
+  let marks: Mark[] = [];
+  try {
+    // No activity log (a session begun on an older runtime): say nothing
+    // rather than read the trimmed marks.
+    marks = parseMarks(readFileSync(`${base}${ACTIVITY_EXT}`, "utf8"));
+  } catch {
+    return null;
+  }
+  // Only the part of the window this session was alive for is judged. Time
+  // before its first beat — a backfill, a unit begun before /clear — is not
+  // idle, it is unknown, and a correction built on it would be wrong.
+  const first = marks.reduce((min, m) => Math.min(min, m.t), Infinity);
+  if (!Number.isFinite(first)) return null;
+  const from = Math.max(win.startMs, first);
+  if (from >= win.endMs) return null;
+  const idle = idleStretches(marks, from, win.endMs, capSeconds * 1000);
+  return idle.length === 0 ? null : idleNotice(win, idle);
+}
+
 /**
  * A beat. Creates state on the fly when SessionStart never fired.
  *
@@ -1548,6 +1678,7 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: P
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
   const now = Date.now();
   appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}\n`);
+  appendLine(`${base}${ACTIVITY_EXT}`, `${isoSeconds(now)} ${k}\n`);
   // One invocation prints at most ONE JSON document: two lines are not JSON.
   let said = false;
   if (k === "prompt") {
@@ -1563,9 +1694,20 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: P
   }
   try {
     const notice = logNudge(agent, session, base, payload, now, cfg);
-    if (notice !== null && !said) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}\n`);
+    if (notice !== null && !said) {
+      said = true;
+      process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}\n`);
+    }
   } catch (err) {
     noteOncePerMinute("nudge", `${agent}\tlog-your-time note skipped: ${errorMessage(err)}`);
+  }
+  try {
+    // A `logged` call never earns the log-your-time note, so the two cannot
+    // both want the one JSON document; `said` guards it anyway.
+    const idle = said ? null : idleWindowNote(agent, base, payload, now, cfg.idleCapSeconds);
+    if (idle !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: idle } })}\n`);
+  } catch (err) {
+    noteOncePerMinute("idle-window", `${agent}\tidle-window note skipped: ${errorMessage(err)}`);
   }
   try {
     // 0 is the whole escape hatch: no cut of any kind, every run waits for
@@ -1972,7 +2114,7 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
   } catch {
     /* already gone */
   }
-  for (const ext of [".nudge.json", ".reload-told"]) {
+  for (const ext of [".nudge.json", ".reload-told", ACTIVITY_EXT]) {
     try {
       unlinkSync(`${base}${ext}`);
     } catch {
@@ -4052,7 +4194,7 @@ export function salvageStaleSessions(cfg: Pick<Config, "idleCapSeconds">, now: n
     if (newest >= now - STALE_SESSION_DAYS * 86_400_000) continue;
     const base = join(dir, name);
     const remove = (): void => {
-      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told"]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told", ACTIVITY_EXT]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {

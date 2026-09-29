@@ -4,6 +4,25 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.15.0 — 2026-09-29
+
+- **An entry that claims idle time is caught as it is logged.** Agents were
+  starting each entry where the previous one ended, to avoid a 409 on
+  touching windows, and did it across breaks too — so an entry for twenty
+  minutes of work began two hours earlier, where the last one stopped. The
+  server cannot see idleness and accepted every one; on one project a quarter
+  of the logged minutes were breaks. Now, right after an agent logs an entry
+  in Claude Code, the hook lays the entry's window over the session's own
+  activity marks. A stretch longer than the idle cap (15 minutes, the same
+  bar the session-end backstop uses) with no activity in it goes back to the
+  agent at once, naming the stretch and the correction — a new `start_time`
+  when the gap leads the entry, or a shorter window when it sits inside. It
+  is advice, not a refusal: a single long build leaves a gap too, and the
+  agent knows which it was.
+- **The log-your-time skill says where a start comes from.** `start_time` is
+  when this unit's work began — its first prompt or tool call — and the
+  previous entry's `end_time` is copied only when the work was contiguous.
+
 ## 1.14.1 — 2026-09-29
 
 - **The "update available" notices give a command that works.** They said

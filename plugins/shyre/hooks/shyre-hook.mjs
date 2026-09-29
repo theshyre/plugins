@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.14.1";
+var VERSION = "1.15.0";
 var CLAUDE_UPDATE_HOW = "run `claude plugin update shyre@theshyre` in a terminal (or `! claude plugin update shyre@theshyre` in the session), then /reload-plugins";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
@@ -815,6 +815,8 @@ function cmdStart(argvAgent, payload, announce = false) {
   }
   appendLine(`${base}.marks`, `${nowIso()} start
 `);
+  appendLine(`${base}${ACTIVITY_EXT}`, `${nowIso()} start
+`);
   const notices = announce ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n) => n !== null) : [];
   for (const notice of notices) {
     try {
@@ -878,6 +880,64 @@ function logNudge(agent, session, base, payload, now, cfg) {
   writeAtomic(path, JSON.stringify(say ? step.state : { ...step.state, notedAt: prior?.notedAt ?? -1 }), 384);
   return say ? nudgeNotice(Math.round(step.state.activeMs / 6e4), thresholdMinutes) : null;
 }
+var ACTIVITY_EXT = ".activity";
+function idleStretches(marks, startMs, endMs, capMs) {
+  if (!(endMs > startMs)) return [];
+  const points = [startMs, ...marks.map((m) => m.t).filter((t) => t > startMs && t < endMs).sort((a, b) => a - b), endMs];
+  const out = [];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    if (a !== void 0 && b !== void 0 && b - a > capMs) out.push({ from: a, to: b });
+  }
+  return out;
+}
+var UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+function jsonField(text, key) {
+  const m = new RegExp(`\\\\?"${key}\\\\?"\\s*:\\s*\\\\?"([^"\\\\]+)`).exec(text);
+  return m?.[1] ?? null;
+}
+function writtenWindow(payload, now) {
+  const p = isRecord(payload) ? payload : {};
+  const response = typeof p.tool_response === "string" ? p.tool_response : JSON.stringify(p.tool_response ?? "");
+  if (/\\?"error\\?"\s*:/.test(response)) return null;
+  const idRaw = jsonField(response, "id");
+  const id = idRaw !== null && UUID.test(idRaw) ? idRaw : null;
+  if (id === null) return null;
+  const request = JSON.stringify(p.tool_input ?? "");
+  const startRaw = jsonField(response, "start_time") ?? jsonField(request, "start_time");
+  const endRaw = jsonField(response, "end_time");
+  const startMs = startRaw === null ? NaN : Date.parse(startRaw);
+  const parsedEnd = endRaw === null ? NaN : Date.parse(endRaw);
+  if (!Number.isFinite(startMs)) return null;
+  return { id, startMs, endMs: Number.isFinite(parsedEnd) ? parsedEnd : now };
+}
+function idleNotice(win, idle) {
+  const minutes = (ms) => Math.round(ms / 6e4);
+  const total2 = minutes(idle.reduce((sum, s) => sum + (s.to - s.from), 0));
+  const listed = idle.map((s) => `${isoSeconds(s.from)} \u2192 ${isoSeconds(s.to)} (${minutes(s.to - s.from)} min)`).join("; ");
+  const lead = idle[0]?.from === win.startMs ? idle[0] : void 0;
+  const target = win.id === null ? "the entry" : `entry ${win.id}`;
+  const fix = lead && idle.length === 1 ? `If that time was not work on this unit, move the start: PATCH /api/v1/entries/${win.id ?? "<id>"} with start_time ${isoSeconds(lead.to)} (or update_time_entry).` : `If that time was not work on this unit, shorten the entry to its active minutes (PATCH /api/v1/entries/${win.id ?? "<id>"} start_time/end_time, or update_time_entry), or split it around the gap.`;
+  return `Shyre: ${target} you just logged runs ${isoSeconds(win.startMs)} \u2192 ${isoSeconds(win.endMs)}, but this session recorded no activity for ${total2} min of it: ${listed}. An entry is active work on this unit, not elapsed time \u2014 a start copied from the previous entry's end claims every break in between. ${fix} If the work did happen (a long build, work in another session on this same unit), leave it.`;
+}
+function idleWindowNote(agent, base, payload, now, capSeconds) {
+  if (agent !== "claude" || toolSignal(payload) !== "logged") return null;
+  const win = writtenWindow(payload, now);
+  if (win === null) return null;
+  let marks = [];
+  try {
+    marks = parseMarks(readFileSync(`${base}${ACTIVITY_EXT}`, "utf8"));
+  } catch {
+    return null;
+  }
+  const first = marks.reduce((min, m) => Math.min(min, m.t), Infinity);
+  if (!Number.isFinite(first)) return null;
+  const from = Math.max(win.startMs, first);
+  if (from >= win.endMs) return null;
+  const idle = idleStretches(marks, from, win.endMs, capSeconds * 1e3);
+  return idle.length === 0 ? null : idleNotice(win, idle);
+}
 function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
@@ -890,6 +950,8 @@ function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const k = tag === "tool" || tag === "stop" || tag === "prompt" ? tag : "tool";
   const now = Date.now();
   appendLine(`${base}.marks`, `${isoSeconds(now)} ${k}
+`);
+  appendLine(`${base}${ACTIVITY_EXT}`, `${isoSeconds(now)} ${k}
 `);
   let said = false;
   if (k === "prompt") {
@@ -906,10 +968,20 @@ function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   }
   try {
     const notice = logNudge(agent, session, base, payload, now, cfg);
-    if (notice !== null && !said) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}
+    if (notice !== null && !said) {
+      said = true;
+      process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: notice } })}
 `);
+    }
   } catch (err) {
     noteOncePerMinute("nudge", `${agent}	log-your-time note skipped: ${errorMessage(err)}`);
+  }
+  try {
+    const idle = said ? null : idleWindowNote(agent, base, payload, now, cfg.idleCapSeconds);
+    if (idle !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: idle } })}
+`);
+  } catch (err) {
+    noteOncePerMinute("idle-window", `${agent}	idle-window note skipped: ${errorMessage(err)}`);
   }
   try {
     if (cfg.checkpointSeconds <= 0) return;
@@ -1186,7 +1258,7 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
     unlinkSync(`${base}.meta.json`);
   } catch {
   }
-  for (const ext of [".nudge.json", ".reload-told"]) {
+  for (const ext of [".nudge.json", ".reload-told", ACTIVITY_EXT]) {
     try {
       unlinkSync(`${base}${ext}`);
     } catch {
@@ -2408,7 +2480,7 @@ function salvageStaleSessions(cfg, now = Date.now()) {
     if (newest >= now - STALE_SESSION_DAYS * 864e5) continue;
     const base = join(dir, name);
     const remove = () => {
-      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told"]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told", ACTIVITY_EXT]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {
@@ -3282,6 +3354,7 @@ if (invokedDirectly()) {
   });
 }
 export {
+  ACTIVITY_EXT,
   AGENT_LABELS,
   CLAUDE_UPDATE_HOW,
   COVERAGE_MAX_PAGES,
@@ -3351,6 +3424,9 @@ export {
   handOffRefused,
   handOffTarget,
   hooksSessionMoving,
+  idleNotice,
+  idleStretches,
+  idleWindowNote,
   installCodex,
   installCursor,
   installId,
@@ -3416,5 +3492,6 @@ export {
   uninstallCursor,
   upgradeRequiredNotice,
   validApiUrl,
-  verifySignedRuntime
+  verifySignedRuntime,
+  writtenWindow
 };
