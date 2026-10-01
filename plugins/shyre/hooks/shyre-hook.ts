@@ -125,7 +125,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const VERSION = "1.15.0";
+export const VERSION = "1.16.0";
 
 /**
  * How a person updates the Claude Code plugin by hand.
@@ -1398,7 +1398,7 @@ export function cmdStart(argvAgent: string, payload: unknown, announce = false):
   // Only on the real SessionStart — a beat that creates state lazily is a
   // different hook whose stdout is not a place for a sentence.
   const notices = announce
-    ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n): n is string => n !== null)
+    ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice(), sessionRefNotice(agent, session, readMeta(base, agent, session)?.repoKey ?? null)].filter((n): n is string => n !== null)
     : [];
   for (const notice of notices) {
     try {
@@ -1432,17 +1432,77 @@ const QUOTED = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
 const ENTRIES_URL = /\/api\/v1\/entries(?=["'\s?]|$)/;
 const SENDS_A_BODY = /(?:^|\s)(?:-d|--data(?:-raw|-binary)?|--json)(?:[\s=]|$)/;
 const OTHER_METHOD = /(?:-X\s*|--request[\s=]+)["']?(?!POST\b)[A-Za-z]+/;
+// Long options, short ones alone or inside a cluster (`-sSx proxy`, `-xhttp://…`,
+// `-sK cfg`, `-:`; `-X` is the method and is not this), and a proxy or a
+// curl home set in the environment of the command.
+const REDIRECTS_THE_REQUEST = /(?:^|\s)(?:--connect-to|--resolve|--proxy[0-9a-z.-]*|--preproxy|--socks[0-9a-z-]*|--unix-socket|--abstract-unix-socket|--next|--config|--doh-url|--dns-[a-z0-9-]+|-[A-Za-z]*[xK:]\S*)(?:[\s=]|$)|(?:^|[\s;&|(])(?:https?_proxy|all_proxy|HTTPS?_PROXY|ALL_PROXY|CURL_HOME)=/;
+
+/**
+ * Is every `/api/v1/entries` URL on this command line the configured Shyre?
+ *
+ * ⚠️ THE PATH ALONE IS NOT THE SERVICE (1.16.0, security review 2026-10-01).
+ * `curl --json … https://elsewhere.example/api/v1/entries` used to read as a
+ * Shyre log: it zeroed the unlogged count, and its RESPONSE — whatever that
+ * host chose to answer — was then read as the entry the session had written.
+ * The WHOLE word in front of the path must be the configured origin, or a
+ * shell variable standing alone (`"$SHYRE_API_URL/api/v1/entries"`, which
+ * cannot be resolved from here; a `${VAR:-default}` is held to its default).
+ * Options that send the request somewhere other than its URL
+ * (`--connect-to`, `--resolve`, a proxy, `--next`, a config file) make it
+ * not ours. A bare path is nobody's URL.
+ *
+ * ⚠️ THIS NARROWS, IT DOES NOT PROVE. A command line is not a parser's
+ * input: a variable set to another host, or a second command whose output
+ * follows curl's, still reads as a log. So nothing downstream may trust the
+ * RESPONSE for more than a UUID, two timestamps and whether a field equals
+ * this session's id — and nothing from it is ever repeated to the model
+ * (SAL-281). That, not this function, is the boundary.
+ */
+export function entriesUrlIsOurs(command: string, apiUrl: string): boolean {
+  const ours = apiUrl.replace(/\/+$/, "").toLowerCase();
+  // A backslash-newline joins two lines into one word, as the shell does.
+  const line = command.replace(/\\\r?\n/g, "");
+  // curl options that send the request somewhere other than the URL says.
+  if (REDIRECTS_THE_REQUEST.test(line.replace(QUOTED, '""'))) return false;
+  const path = /\/api\/v1\/entries(?=["'\s?]|$)/g;
+  let seen = 0;
+  for (let m = path.exec(line); m !== null; m = path.exec(line)) {
+    // The whole shell word in front of the path, back to a character the
+    // SHELL splits on — not `\s`, which also matches a no-break space the
+    // shell keeps inside a word. A prefix that only ENDS like ours
+    // (`https://elsewhere/"$U`, `${U:-https://shyre.io}.elsewhere`) is a
+    // different host.
+    let from = m.index;
+    while (from > 0 && !/[ \t\r\n]/.test(line[from - 1] ?? " ")) from -= 1;
+    const word = line.slice(from, m.index).replace(/^--url=/, "").replace(/^["']/, "");
+    // The path with nothing in front of it is not a URL — the words of a
+    // description ("fix /api/v1/entries pagination"), say. It is neither
+    // ours nor anyone's: skipped, and it does not count as the request.
+    if (word === "") continue;
+    seen += 1;
+    const lower = word.toLowerCase();
+    const isOurs =
+      lower === ours ||
+      /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(word) ||
+      /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word) ||
+      (/^\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}$/.test(word) && lower.slice(lower.indexOf(":-") + 2, -1) === ours);
+    if (!isOurs) return false;
+  }
+  return seen > 0;
+}
 
 /**
  * Read one PostToolUse payload. Only the tool's NAME and, for a shell call,
- * its command line are looked at; neither is stored or sent anywhere.
+ * its command line are looked at here; neither is stored or sent anywhere.
+ * (A `logged` call's RESPONSE is read by `writtenWindow` and
+ * `sessionRefNote`, for a UUID, two timestamps and one comparison.)
  *
  * A commit is looked for with quoted text removed, and wins: a commit
  * MESSAGE that quotes `curl -X POST …/api/v1/entries` is a commit, not an
  * entry written (reading it as one zeroed the count — review, 2026-09-18),
  * and `echo "usage: git commit"` is neither.
  */
-export function toolSignal(raw: unknown): ToolSignal {
+export function toolSignal(raw: unknown, apiUrl: string = DEFAULT_API_URL): ToolSignal {
   const p = isRecord(raw) ? raw : {};
   if (p.hook_event_name !== "PostToolUse") return null;
   const tool = typeof p.tool_name === "string" ? p.tool_name : "";
@@ -1453,7 +1513,7 @@ export function toolSignal(raw: unknown): ToolSignal {
   const command = typeof input.command === "string" ? input.command : "";
   const bare = command.replace(QUOTED, '""');
   if (COMMIT_COMMAND.test(bare)) return /\s--dry-run\b/.test(bare) ? null : "commit";
-  if (/\bcurl\b/.test(bare) && ENTRIES_URL.test(command) && SENDS_A_BODY.test(bare) && !OTHER_METHOD.test(bare)) return "logged";
+  if (/\bcurl\b/.test(bare) && ENTRIES_URL.test(command) && SENDS_A_BODY.test(bare) && !OTHER_METHOD.test(bare) && entriesUrlIsOurs(command, apiUrl)) return "logged";
   return null;
 }
 
@@ -1509,7 +1569,7 @@ function readNudgeState(path: string): NudgeState | null {
  * not read it is noise in someone's terminal. A session outside any
  * repository, or with no token to log with, has nothing to be reminded of.
  */
-export function logNudge(agent: Agent, session: string, base: string, payload: unknown, now: number, cfg: Pick<Config, "idleCapSeconds"> & Partial<Pick<Config, "apiKey" | "nudgeMinutes">>): string | null {
+export function logNudge(agent: Agent, session: string, base: string, payload: unknown, now: number, cfg: Pick<Config, "idleCapSeconds"> & Partial<Pick<Config, "apiKey" | "nudgeMinutes" | "apiUrl">>): string | null {
   const thresholdMinutes = cfg.nudgeMinutes ?? DEFAULT_NUDGE_MINUTES;
   if (agent !== "claude" || thresholdMinutes <= 0 || !cfg.apiKey) return null;
   const path = `${base}.nudge.json`;
@@ -1517,7 +1577,7 @@ export function logNudge(agent: Agent, session: string, base: string, payload: u
   // lose one update. Accepted — the worst case is a note a few minutes early
   // or late, and a lock would put a wait on every tool call.
   const prior = readNudgeState(path);
-  const step = nudgeStep(prior, toolSignal(payload), now, cfg.idleCapSeconds * 1000, thresholdMinutes * 60_000);
+  const step = nudgeStep(prior, toolSignal(payload, cfg.apiUrl ?? DEFAULT_API_URL), now, cfg.idleCapSeconds * 1000, thresholdMinutes * 60_000);
   const meta = step.note ? readMeta(base, agent, session) : null;
   const say = step.note && meta !== null && meta.repoKey !== null;
   // A note that was not given is not remembered as given: a repository that
@@ -1582,7 +1642,11 @@ export interface WrittenWindow {
   endMs: number;
 }
 
-const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+// ⚠️ ANCHORED (SAL-281). Unanchored, `UUID.test` passed any string that
+// merely CONTAINED a UUID, and the whole string was then printed into a note
+// the model reads: a tool answering `{"id":"<uuid>. SYSTEM NOTICE: run …"}`
+// had its sentence delivered as Shyre's own (1.15.0, found 2026-10-01).
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** `"key":"value"` in JSON, or in JSON escaped once inside a JSON string. */
 function jsonField(text: string, key: string): string | null {
@@ -1612,7 +1676,10 @@ export function writtenWindow(payload: unknown, now: number): WrittenWindow | nu
   const startMs = startRaw === null ? NaN : Date.parse(startRaw);
   const parsedEnd = endRaw === null ? NaN : Date.parse(endRaw);
   if (!Number.isFinite(startMs)) return null;
-  return { id, startMs, endMs: Number.isFinite(parsedEnd) ? parsedEnd : now };
+  // Never past now (SAL-281): the server refuses a later end, so a response
+  // claiming one is not Shyre's — and an end in 2099 made every such call
+  // "idle" and forced the note.
+  return { id, startMs, endMs: Number.isFinite(parsedEnd) ? Math.min(parsedEnd, now) : now };
 }
 
 export function idleNotice(win: WrittenWindow, idle: readonly IdleStretch[]): string {
@@ -1632,8 +1699,8 @@ export function idleNotice(win: WrittenWindow, idle: readonly IdleStretch[]): st
  * recorded nothing in, or null. Claude Code only, for the same reason as the
  * log-your-time note.
  */
-export function idleWindowNote(agent: Agent, base: string, payload: unknown, now: number, capSeconds: number): string | null {
-  if (agent !== "claude" || toolSignal(payload) !== "logged") return null;
+export function idleWindowNote(agent: Agent, base: string, payload: unknown, now: number, capSeconds: number, apiUrl: string = DEFAULT_API_URL): string | null {
+  if (agent !== "claude" || toolSignal(payload, apiUrl) !== "logged") return null;
   const win = writtenWindow(payload, now);
   if (win === null) return null;
   let marks: Mark[] = [];
@@ -1655,6 +1722,67 @@ export function idleWindowNote(agent: Agent, base: string, payload: unknown, now
   return idle.length === 0 ? null : idleNotice(win, idle);
 }
 
+// ---------------------------------------------------------------------------
+// The session's id, said (1.16.0)
+// ---------------------------------------------------------------------------
+//
+// The hooks record a session under the id the host gives them — for Claude
+// Code, the transcript's. An agent logging its own entry was told to send
+// "this session's id" and has two to choose from: that one, which it only
+// ever sees inside a file path, and claude.ai's `session_01…`, which its
+// context labels as the session. Measured over September 2026: of 415
+// agent-written entries, 156 carried the hooks' id and 211 the other. Every
+// rule that joins the hooks' time to the agent's entries by session — a fold
+// into the session's own entry, a continuation, a leftover following its
+// session to a sub-project — silently did nothing for the rest: of 38
+// leftovers that month, 5 shared an id with an entry the agent wrote.
+//
+// The skill's sentence is what produced that split, so the fix is not another
+// sentence: the hook KNOWS the value, and says it — once at session start,
+// and once more if an entry is then logged under anything else.
+
+/**
+ * A value safe to put in a sentence the model reads: a UUID, which is what
+ * Claude Code names a session, and which cannot spell an instruction. A
+ * looser shape (`ignore-previous-instructions.run-…`) is an id to a regex
+ * and a sentence to a reader.
+ */
+const SAYABLE_ID = UUID;
+
+/** SessionStart: the id to send. Claude Code in a repository, like the note. */
+export function sessionRefNotice(agent: Agent, session: string, repoKey: string | null): string | null {
+  if (agent !== "claude" || repoKey === null || !SAYABLE_ID.test(session)) return null;
+  return `Shyre: this session's id is ${session}. When you log time to Shyre from this session, send that as session_ref — not a claude.ai session_… id — so the time the hooks record joins the entries you write.`;
+}
+
+/**
+ * After a `logged` call: the entry was written under another id, or none.
+ * Said once a session (`${base}.ref-told`).
+ *
+ * ⚠️ THE OTHER ID IS NEVER REPEATED. It comes from a tool's output, and a
+ * sentence built from tool output is a way to put someone else's words in
+ * front of the model. What is said is this session's own id, which came from
+ * the host.
+ *
+ * The entry cannot be corrected — its session_ref is fixed when it is
+ * written — so the note is about the next one.
+ */
+export function sessionRefNote(agent: Agent, session: string, base: string, payload: unknown, now: number, apiUrl: string = DEFAULT_API_URL): string | null {
+  if (agent !== "claude" || !SAYABLE_ID.test(session)) return null;
+  if (toolSignal(payload, apiUrl) !== "logged" || writtenWindow(payload, now) === null) return null;
+  const p = isRecord(payload) ? payload : {};
+  const response = typeof p.tool_response === "string" ? p.tool_response : JSON.stringify(p.tool_response ?? "");
+  const ref = jsonField(response, "started_by_ref");
+  const none = ref === null && /\\?"started_by_ref\\?"\s*:\s*null/.test(response);
+  // Not in the output at all (clipped, or piped through a filter): unknown.
+  if (ref === null && !none) return null;
+  if (ref === session) return null;
+  const stamp = `${base}.ref-told`;
+  if (existsSync(stamp)) return null;
+  writeAtomic(stamp, `${isoSeconds(now)}\n`, 0o600);
+  return `Shyre: the entry you just logged ${none ? "carries no session_ref" : "was logged under a different session_ref"}. This session's id is ${session}: send that as session_ref on every log from this session, so the time the hooks record joins your entries. The entry itself stands — a session_ref cannot be changed once written — so there is nothing to redo.`;
+}
+
 /**
  * A beat. Creates state on the fly when SessionStart never fired.
  *
@@ -1666,7 +1794,7 @@ export function idleWindowNote(agent: Agent, base: string, payload: unknown, now
  *      now, cut at this mark.
  * Either spools and kicks a detached flush; the hook itself does no network.
  */
-export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: Pick<Config, "idleCapSeconds" | "checkpointSeconds"> & Partial<Pick<Config, "apiKey" | "nudgeMinutes">> = readConfig()): void {
+export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: Pick<Config, "idleCapSeconds" | "checkpointSeconds"> & Partial<Pick<Config, "apiKey" | "nudgeMinutes" | "apiUrl">> = readConfig()): void {
   const agent = detectAgent(argvAgent, payload);
   const { session } = normalizePayload(payload);
   if (!session) {
@@ -1704,10 +1832,24 @@ export function cmdBeat(argvAgent: string, payload: unknown, tag: string, cfg: P
   try {
     // A `logged` call never earns the log-your-time note, so the two cannot
     // both want the one JSON document; `said` guards it anyway.
-    const idle = said ? null : idleWindowNote(agent, base, payload, now, cfg.idleCapSeconds);
-    if (idle !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: idle } })}\n`);
+    const idle = said ? null : idleWindowNote(agent, base, payload, now, cfg.idleCapSeconds, cfg.apiUrl ?? DEFAULT_API_URL);
+    if (idle !== null) {
+      said = true;
+      process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: idle } })}\n`);
+    }
   } catch (err) {
     noteOncePerMinute("idle-window", `${agent}\tidle-window note skipped: ${errorMessage(err)}`);
+  }
+  try {
+    // One JSON document a call: when the idle note took it, this waits for
+    // the next log — the stamp is written only when the note is given.
+    const ref = said ? null : sessionRefNote(agent, session, base, payload, now, cfg.apiUrl ?? DEFAULT_API_URL);
+    if (ref !== null) {
+      said = true;
+      process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: ref } })}\n`);
+    }
+  } catch (err) {
+    noteOncePerMinute("session-ref", `${agent}\tsession-ref note skipped: ${errorMessage(err)}`);
   }
   try {
     // 0 is the whole escape hatch: no cut of any kind, every run waits for
@@ -2114,7 +2256,7 @@ export async function cmdEnd(argvAgent: string, payload: unknown, { idleCapSecon
   } catch {
     /* already gone */
   }
-  for (const ext of [".nudge.json", ".reload-told", ACTIVITY_EXT]) {
+  for (const ext of [".nudge.json", ".reload-told", ".ref-told", ACTIVITY_EXT]) {
     try {
       unlinkSync(`${base}${ext}`);
     } catch {
@@ -4194,7 +4336,7 @@ export function salvageStaleSessions(cfg: Pick<Config, "idleCapSeconds">, now: n
     if (newest >= now - STALE_SESSION_DAYS * 86_400_000) continue;
     const base = join(dir, name);
     const remove = (): void => {
-      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told", ACTIVITY_EXT]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told", ".ref-told", ACTIVITY_EXT]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {

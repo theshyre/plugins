@@ -5,7 +5,7 @@ Shyre keeps the record of work a business bills and budgets from: time that logs
 Today there is one plugin: **shyre**, deterministic time tracking for agent
 sessions.
 
-**Latest release:** 1.15.0 (2026-09-29) — see `CHANGELOG.md`.
+**Latest release:** 1.16.0 (2026-10-01) — see `CHANGELOG.md`.
 
 ```bash
 claude plugin marketplace add theshyre/plugins
@@ -85,7 +85,10 @@ first so one set of hooks runs.
   noticing the moment. After the agent logs, the hook also checks the entry
   against the session's own activity (1.15.0): a window that claims more than
   fifteen minutes in which the session did nothing — a start copied across a
-  break — goes straight back to the agent with the correction to make.
+  break — goes straight back to the agent with the correction to make. And the
+  hook tells the agent which session id to log under (1.16.0), at session
+  start and again if an entry lands under another, so the time the hooks
+  record and the entries the agent writes belong to the same session.
 - **Backfill.** `backfill --since=YYYY-MM-DD --dry-run` reconstructs runs
   from this machine's Claude Code transcripts for sessions before the plugin
   was installed — timestamps only — and logs them marked *backfilled*.

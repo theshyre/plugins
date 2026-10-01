@@ -70,7 +70,12 @@ no note; the rule above is the whole control there.
      when there is one.
    - `agent_label` — this agent's name (`Claude Code`, `Codex`, `Cursor`,
      …). Always send it; the label is immutable once written.
-   - `session_ref` — this session's id.
+   - `session_ref` — the session id the Shyre hook states when the session
+     starts ("Shyre: this session's id is …") — for Claude Code, the
+     transcript's id, a UUID. Not the `session_…` id from a claude.ai link:
+     the hooks record the session under the first, and time they record
+     joins only entries logged under it. If the hook has not stated one,
+     send the id your host reports for the session.
    - `idempotency_key` — unique per unit, e.g. `<branch>:<short-slug>`.
      Never the bare branch: two units on one branch would collapse into one.
    - Do **not** set `billable`; the server decides.

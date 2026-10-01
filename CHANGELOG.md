@@ -4,6 +4,39 @@ All notable changes to the `shyre` plugin. The version is the one in
 `plugins/shyre/.claude-plugin/plugin.json`; each release is tagged `v<version>`
 here and `plugin-v<version>` in the Shyre repository.
 
+## 1.16.0 — 2026-10-01
+
+- **The hook tells the agent which session id to log under.** The hooks
+  record a session under the id the host gives them — in Claude Code, the
+  transcript's. An agent logging its own entry was told to send "this
+  session's id" and had two to pick from: that one, which it only sees inside
+  a file path, and the `session_…` id of its claude.ai link. Over September,
+  211 of 415 agent-written entries carried the second. Everything that joins
+  the hooks' time to the agent's entries by session — leftover minutes
+  following the session to the sub-project it worked on, a log continuing
+  the previous entry — did nothing for those: of 38 leftover entries that
+  month, 5 shared an id with an entry the agent wrote. Now, in Claude Code,
+  the hook states the id when the session starts (and again after a
+  compaction), and once more if an entry is then logged under a different
+  id or none. It names only this session's own id, never the one it found.
+  An entry already written keeps the id it was written with.
+- **The log-your-time skill names the id** instead of saying "this
+  session's id".
+- **Security: a tool's output can no longer speak as Shyre (SAL-281).**
+  1.15.0 named the logged entry in its idle-window note, and took the id
+  from the tool's response with a check that passed any text containing a
+  UUID. A tool that answered with an id followed by a sentence — a malicious
+  MCP server with a `log_time_entry` tool, or a `curl` the agent was led to
+  run against another host's `/api/v1/entries` — had that sentence handed to
+  the model as a note from Shyre. Now the id must be a UUID and nothing
+  more, an end time past the present is cut to the present, and no note
+  repeats anything else from a response. Update from 1.15.0.
+- **A shell call counts as a Shyre log only when it is addressed to your
+  Shyre.** The whole URL must be the configured address, or a shell variable
+  standing alone, with no option that sends the request elsewhere. This
+  narrows what the hook reads; it is the rule above — nothing from a
+  response is repeated — that the hook relies on.
+
 ## 1.15.0 — 2026-09-29
 
 - **An entry that claims idle time is caught as it is logged.** Agents were

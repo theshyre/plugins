@@ -5,7 +5,7 @@ server and the log-your-own-time convention, in one installable unit.
 
 Shyre keeps the record of work a business bills and budgets from: time that logs itself as people and their coding agents work, turned into proposals, invoices and signed sign-offs for consultants, and cost reports for teams.
 
-**Latest release:** 1.15.0 (2026-09-29) — see `../../CHANGELOG.md`.
+**Latest release:** 1.16.0 (2026-10-01) — see `../../CHANGELOG.md`.
 
 ```
 claude plugin marketplace add theshyre/plugins
@@ -70,7 +70,8 @@ What ships:
   note (`SHYRE_LOG_NUDGE_MINUTES`, `0` for off). After an entry is logged,
   the hook lays its window over the session's activity and tells the agent
   about any stretch over the idle cap with none in it, and how to correct it
-  (1.15.0).
+  (1.15.0). It also states the session id to send as `session_ref` — at
+  session start, and once more if an entry is logged under another (1.16.0).
 
 Cursor, and Codex without the plugin — including the Codex VS Code extension, which does not support plugins — use the same runtime through its installer. From 1.10.0 that installed copy replaces itself with each new signed release:
 

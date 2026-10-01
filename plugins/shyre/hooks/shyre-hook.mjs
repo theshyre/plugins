@@ -128,7 +128,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
  *   run. Timestamps only — no prompt text, no diff, no file names. The day
  *   view uses them to suggest how an overlap between two sessions splits.
  */
-var VERSION = "1.15.0";
+var VERSION = "1.16.0";
 var CLAUDE_UPDATE_HOW = "run `claude plugin update shyre@theshyre` in a terminal (or `! claude plugin update shyre@theshyre` in the session), then /reload-plugins";
 var AGENT_LABELS = Object.freeze({
   claude: "Claude Code",
@@ -817,7 +817,7 @@ function cmdStart(argvAgent, payload, announce = false) {
 `);
   appendLine(`${base}${ACTIVITY_EXT}`, `${nowIso()} start
 `);
-  const notices = announce ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice()].filter((n) => n !== null) : [];
+  const notices = announce ? [upgradeRequiredNotice(agent), selfUpdateNotice(), pluginUpdateNotice(), staleNotice(agent, process.env, readConfig().apiUrl), autoUpdateNotice(agent, process.env, Date.now(), cwd || process.cwd()), tokenRefusalNotice(), sessionRefNotice(agent, session, readMeta(base, agent, session)?.repoKey ?? null)].filter((n) => n !== null) : [];
   for (const notice of notices) {
     try {
       process.stdout.write(`${notice}
@@ -832,7 +832,26 @@ var QUOTED = /"(?:[^"\\]|\\.)*"|'[^']*'/g;
 var ENTRIES_URL = /\/api\/v1\/entries(?=["'\s?]|$)/;
 var SENDS_A_BODY = /(?:^|\s)(?:-d|--data(?:-raw|-binary)?|--json)(?:[\s=]|$)/;
 var OTHER_METHOD = /(?:-X\s*|--request[\s=]+)["']?(?!POST\b)[A-Za-z]+/;
-function toolSignal(raw) {
+var REDIRECTS_THE_REQUEST = /(?:^|\s)(?:--connect-to|--resolve|--proxy[0-9a-z.-]*|--preproxy|--socks[0-9a-z-]*|--unix-socket|--abstract-unix-socket|--next|--config|--doh-url|--dns-[a-z0-9-]+|-[A-Za-z]*[xK:]\S*)(?:[\s=]|$)|(?:^|[\s;&|(])(?:https?_proxy|all_proxy|HTTPS?_PROXY|ALL_PROXY|CURL_HOME)=/;
+function entriesUrlIsOurs(command, apiUrl) {
+  const ours = apiUrl.replace(/\/+$/, "").toLowerCase();
+  const line = command.replace(/\\\r?\n/g, "");
+  if (REDIRECTS_THE_REQUEST.test(line.replace(QUOTED, '""'))) return false;
+  const path = /\/api\/v1\/entries(?=["'\s?]|$)/g;
+  let seen = 0;
+  for (let m = path.exec(line); m !== null; m = path.exec(line)) {
+    let from = m.index;
+    while (from > 0 && !/[ \t\r\n]/.test(line[from - 1] ?? " ")) from -= 1;
+    const word = line.slice(from, m.index).replace(/^--url=/, "").replace(/^["']/, "");
+    if (word === "") continue;
+    seen += 1;
+    const lower = word.toLowerCase();
+    const isOurs = lower === ours || /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(word) || /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(word) || /^\$\{[A-Za-z_][A-Za-z0-9_]*:-[^}]*\}$/.test(word) && lower.slice(lower.indexOf(":-") + 2, -1) === ours;
+    if (!isOurs) return false;
+  }
+  return seen > 0;
+}
+function toolSignal(raw, apiUrl = DEFAULT_API_URL) {
   const p = isRecord(raw) ? raw : {};
   if (p.hook_event_name !== "PostToolUse") return null;
   const tool = typeof p.tool_name === "string" ? p.tool_name : "";
@@ -842,7 +861,7 @@ function toolSignal(raw) {
   const command = typeof input.command === "string" ? input.command : "";
   const bare = command.replace(QUOTED, '""');
   if (COMMIT_COMMAND.test(bare)) return /\s--dry-run\b/.test(bare) ? null : "commit";
-  if (/\bcurl\b/.test(bare) && ENTRIES_URL.test(command) && SENDS_A_BODY.test(bare) && !OTHER_METHOD.test(bare)) return "logged";
+  if (/\bcurl\b/.test(bare) && ENTRIES_URL.test(command) && SENDS_A_BODY.test(bare) && !OTHER_METHOD.test(bare) && entriesUrlIsOurs(command, apiUrl)) return "logged";
   return null;
 }
 function nudgeStep(state, signal, now, idleCapMs, thresholdMs) {
@@ -874,7 +893,7 @@ function logNudge(agent, session, base, payload, now, cfg) {
   if (agent !== "claude" || thresholdMinutes <= 0 || !cfg.apiKey) return null;
   const path = `${base}.nudge.json`;
   const prior = readNudgeState(path);
-  const step = nudgeStep(prior, toolSignal(payload), now, cfg.idleCapSeconds * 1e3, thresholdMinutes * 6e4);
+  const step = nudgeStep(prior, toolSignal(payload, cfg.apiUrl ?? DEFAULT_API_URL), now, cfg.idleCapSeconds * 1e3, thresholdMinutes * 6e4);
   const meta = step.note ? readMeta(base, agent, session) : null;
   const say = step.note && meta !== null && meta.repoKey !== null;
   writeAtomic(path, JSON.stringify(say ? step.state : { ...step.state, notedAt: prior?.notedAt ?? -1 }), 384);
@@ -892,7 +911,7 @@ function idleStretches(marks, startMs, endMs, capMs) {
   }
   return out;
 }
-var UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function jsonField(text, key) {
   const m = new RegExp(`\\\\?"${key}\\\\?"\\s*:\\s*\\\\?"([^"\\\\]+)`).exec(text);
   return m?.[1] ?? null;
@@ -910,7 +929,7 @@ function writtenWindow(payload, now) {
   const startMs = startRaw === null ? NaN : Date.parse(startRaw);
   const parsedEnd = endRaw === null ? NaN : Date.parse(endRaw);
   if (!Number.isFinite(startMs)) return null;
-  return { id, startMs, endMs: Number.isFinite(parsedEnd) ? parsedEnd : now };
+  return { id, startMs, endMs: Number.isFinite(parsedEnd) ? Math.min(parsedEnd, now) : now };
 }
 function idleNotice(win, idle) {
   const minutes = (ms) => Math.round(ms / 6e4);
@@ -921,8 +940,8 @@ function idleNotice(win, idle) {
   const fix = lead && idle.length === 1 ? `If that time was not work on this unit, move the start: PATCH /api/v1/entries/${win.id ?? "<id>"} with start_time ${isoSeconds(lead.to)} (or update_time_entry).` : `If that time was not work on this unit, shorten the entry to its active minutes (PATCH /api/v1/entries/${win.id ?? "<id>"} start_time/end_time, or update_time_entry), or split it around the gap.`;
   return `Shyre: ${target} you just logged runs ${isoSeconds(win.startMs)} \u2192 ${isoSeconds(win.endMs)}, but this session recorded no activity for ${total2} min of it: ${listed}. An entry is active work on this unit, not elapsed time \u2014 a start copied from the previous entry's end claims every break in between. ${fix} If the work did happen (a long build, work in another session on this same unit), leave it.`;
 }
-function idleWindowNote(agent, base, payload, now, capSeconds) {
-  if (agent !== "claude" || toolSignal(payload) !== "logged") return null;
+function idleWindowNote(agent, base, payload, now, capSeconds, apiUrl = DEFAULT_API_URL) {
+  if (agent !== "claude" || toolSignal(payload, apiUrl) !== "logged") return null;
   const win = writtenWindow(payload, now);
   if (win === null) return null;
   let marks = [];
@@ -937,6 +956,26 @@ function idleWindowNote(agent, base, payload, now, capSeconds) {
   if (from >= win.endMs) return null;
   const idle = idleStretches(marks, from, win.endMs, capSeconds * 1e3);
   return idle.length === 0 ? null : idleNotice(win, idle);
+}
+var SAYABLE_ID = UUID;
+function sessionRefNotice(agent, session, repoKey) {
+  if (agent !== "claude" || repoKey === null || !SAYABLE_ID.test(session)) return null;
+  return `Shyre: this session's id is ${session}. When you log time to Shyre from this session, send that as session_ref \u2014 not a claude.ai session_\u2026 id \u2014 so the time the hooks record joins the entries you write.`;
+}
+function sessionRefNote(agent, session, base, payload, now, apiUrl = DEFAULT_API_URL) {
+  if (agent !== "claude" || !SAYABLE_ID.test(session)) return null;
+  if (toolSignal(payload, apiUrl) !== "logged" || writtenWindow(payload, now) === null) return null;
+  const p = isRecord(payload) ? payload : {};
+  const response = typeof p.tool_response === "string" ? p.tool_response : JSON.stringify(p.tool_response ?? "");
+  const ref = jsonField(response, "started_by_ref");
+  const none = ref === null && /\\?"started_by_ref\\?"\s*:\s*null/.test(response);
+  if (ref === null && !none) return null;
+  if (ref === session) return null;
+  const stamp = `${base}.ref-told`;
+  if (existsSync(stamp)) return null;
+  writeAtomic(stamp, `${isoSeconds(now)}
+`, 384);
+  return `Shyre: the entry you just logged ${none ? "carries no session_ref" : "was logged under a different session_ref"}. This session's id is ${session}: send that as session_ref on every log from this session, so the time the hooks record joins your entries. The entry itself stands \u2014 a session_ref cannot be changed once written \u2014 so there is nothing to redo.`;
 }
 function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
   const agent = detectAgent(argvAgent, payload);
@@ -977,11 +1016,24 @@ function cmdBeat(argvAgent, payload, tag, cfg = readConfig()) {
     noteOncePerMinute("nudge", `${agent}	log-your-time note skipped: ${errorMessage(err)}`);
   }
   try {
-    const idle = said ? null : idleWindowNote(agent, base, payload, now, cfg.idleCapSeconds);
-    if (idle !== null) process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: idle } })}
+    const idle = said ? null : idleWindowNote(agent, base, payload, now, cfg.idleCapSeconds, cfg.apiUrl ?? DEFAULT_API_URL);
+    if (idle !== null) {
+      said = true;
+      process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: idle } })}
 `);
+    }
   } catch (err) {
     noteOncePerMinute("idle-window", `${agent}	idle-window note skipped: ${errorMessage(err)}`);
+  }
+  try {
+    const ref = said ? null : sessionRefNote(agent, session, base, payload, now, cfg.apiUrl ?? DEFAULT_API_URL);
+    if (ref !== null) {
+      said = true;
+      process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: ref } })}
+`);
+    }
+  } catch (err) {
+    noteOncePerMinute("session-ref", `${agent}	session-ref note skipped: ${errorMessage(err)}`);
   }
   try {
     if (cfg.checkpointSeconds <= 0) return;
@@ -1258,7 +1310,7 @@ async function cmdEnd(argvAgent, payload, { idleCapSeconds }, scrape = scrapeSes
     unlinkSync(`${base}.meta.json`);
   } catch {
   }
-  for (const ext of [".nudge.json", ".reload-told", ACTIVITY_EXT]) {
+  for (const ext of [".nudge.json", ".reload-told", ".ref-told", ACTIVITY_EXT]) {
     try {
       unlinkSync(`${base}${ext}`);
     } catch {
@@ -2480,7 +2532,7 @@ function salvageStaleSessions(cfg, now = Date.now()) {
     if (newest >= now - STALE_SESSION_DAYS * 864e5) continue;
     const base = join(dir, name);
     const remove = () => {
-      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told", ACTIVITY_EXT]) {
+      for (const ext of [".marks", ".meta.json", ".nudge.json", ".reload-told", ".ref-told", ACTIVITY_EXT]) {
         try {
           unlinkSync(`${base}${ext}`);
         } catch {
@@ -3414,6 +3466,7 @@ export {
   detectAgent,
   doctorLines,
   earliestFreeStart,
+  entriesUrlIsOurs,
   fetchCoverage,
   foldTarget,
   foldTargets,
@@ -3479,6 +3532,8 @@ export {
   selfUpdateNotice,
   selfUpdatePath,
   selfUpdateSkipReason,
+  sessionRefNote,
+  sessionRefNotice,
   sessionStillOpen,
   shyreHome,
   signedRuntimeVersion,
